@@ -1,11 +1,17 @@
 """Starter Listener: watch live Polymarket order book changes.
 
-Finds the busiest Polymarket questions, connects to Polymarket's live feed,
-and prints every change in plain English. Press Ctrl+C to stop.
+Finds the busiest Polymarket questions (or the questions in one event you name),
+connects to Polymarket's live feed, and prints every change in plain English.
+Press Ctrl+C to stop.
+
+    python3 listener.py                     # the 3 busiest questions on Polymarket
+    python3 listener.py <event-slug>        # every question in one event, e.g.
+    python3 listener.py laliga-2027-champion-20260701200737375
 """
 import asyncio
 import json
 import ssl
+import sys
 
 import certifi
 import httpx
@@ -13,6 +19,7 @@ import websockets
 
 HOW_MANY_QUESTIONS = 3
 LIST_URL = "https://gamma-api.polymarket.com/markets"
+EVENT_URL = "https://gamma-api.polymarket.com/events"
 LIVE_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
@@ -32,6 +39,25 @@ def pick_busiest_questions():
         questions.append({"question": market["question"], "yes": yes_tag, "no": no_tag})
         if len(questions) == HOW_MANY_QUESTIONS:
             break
+    return questions
+
+
+def questions_in_event(slug):
+    """Ask Polymarket for one event (the slug is the end of its polymarket.com/event/... link)."""
+    reply = httpx.get(EVENT_URL, params={"slug": slug}, timeout=20)
+    reply.raise_for_status()
+    events = reply.json()
+    if not events:
+        sys.exit(f"Polymarket has no event called '{slug}'. Copy the part after polymarket.com/event/ in its link.")
+    event = events[0]
+    print(f"Event: {event['title']}")
+    questions = []
+    for market in event.get("markets", []):
+        if market.get("closed") or not market.get("enableOrderBook") or not market.get("clobTokenIds"):
+            continue
+        yes_tag, no_tag = json.loads(market["clobTokenIds"])
+        label = market.get("groupItemTitle") or market["question"]
+        questions.append({"question": label, "yes": yes_tag, "no": no_tag})
     return questions
 
 
@@ -94,8 +120,12 @@ async def listen(questions):
 
 
 def main():
-    print("Asking Polymarket for its busiest questions...")
-    questions = pick_busiest_questions()
+    if len(sys.argv) > 1:
+        print("Asking Polymarket for that event...")
+        questions = questions_in_event(sys.argv[1])
+    else:
+        print("Asking Polymarket for its busiest questions...")
+        questions = pick_busiest_questions()
     for q in questions:
         print(f"  - {q['question']}")
     print()

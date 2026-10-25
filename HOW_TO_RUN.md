@@ -33,6 +33,15 @@ Wait until it finishes and you can type again.
 - **Mac:** `python3 listener.py`
 - **Windows:** `python listener.py`
 
+### Watch one specific event instead
+
+Every Polymarket event has a link like `polymarket.com/event/laliga-2027-champion-20260701200737375`. The part after `/event/` is its name tag (the "slug"). Put it after `listener.py`:
+
+- **Mac:** `python3 listener.py laliga-2027-champion-20260701200737375`
+- **Windows:** `python listener.py laliga-2027-champion-20260701200737375`
+
+The Listener then watches every question in that event (for LaLiga, one per team).
+
 ## What you will see
 
 ```
