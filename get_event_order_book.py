@@ -13,15 +13,16 @@ def _get(url: str, params: dict | None = None):
 
 def resolve_slug(slug: str) -> list[dict]:
     """Return the markets behind a slug, which may be an event or a market slug."""
-    # 1) Try as an event slug (multi-market events, e.g. "La Liga champion")
-    events = _get(f"{GAMMA}/events", {"slug": slug})
-    if events:
-        return events[0].get("markets", [])
 
-    # 2) Fall back to a single-market slug
+    # Try as a single-market slug first
     markets = _get(f"{GAMMA}/markets", {"slug": slug})
     if markets:
         return markets
+    
+    # Try as an event slug (multi-market events, e.g. "La Liga champion")
+    events = _get(f"{GAMMA}/events", {"slug": slug})
+    if events:
+        return events[0].get("markets", [])
 
     raise ValueError(f"No event or market found for slug {slug!r}")
 
@@ -75,8 +76,8 @@ def fetch_books(slug: str, team: str | None = None) -> dict:
 
 if __name__ == "__main__":
     # nba-mem-uta-2026-10-26
-    # result = fetch_books("laliga-2027-champion-20260701200737375", team="Barcelona")
-    result = fetch_books("nba-mem-uta-2026-10-26", "Grizzlies")
+    result = fetch_books("laliga-2027-champion-20260701200737375", team="Barcelona")
+    # result = fetch_books("nba-mem-uta-2026-10-26", "Grizzlies")
     print(result["question"])
     for outcome, book in result["books"].items():
         print(outcome, "bid:", book["bids"][:1], "ask:", book["asks"][:1])
