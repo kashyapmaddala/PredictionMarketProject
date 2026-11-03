@@ -783,3 +783,49 @@ and historical derived-table output remain future work.
 
 - Corrected clean-stop handling: retain historical quotes and depth while recording
   collection status separately; disconnects still require a fresh snapshot.
+
+## 17. Validating a Normalized Dataset
+
+```sh
+python validate.py data/clean/2026-11-03-v1
+python validate.py data/clean/2026-11-03-v1 --lag-warning-ms 10000
+python -m pytest -q test_normalize.py test_reconstruct.py test_validate.py
+```
+
+The validator prints a JSON report and exits with code 1 on errors, or 0 for
+warnings/informational findings only. Errors include manifest/hash/schema/count
+mismatches, malformed records, duplicate capture positions, invalid levels, and
+locked or crossed reconstructed books. Checks run after complete exchange events,
+so temporary intermediate states within a multi-level update are not flagged.
+
+Warnings include collection interruptions, unsupported messages, updates without
+usable snapshots, missing exchange timestamps, receive-clock regressions, and
+negative or unusually large exchange-to-receive timestamp differences. The default
+positive difference threshold is 5,000 ms. These differences are not measurements
+of pure network latency: snapshot age and clock skew also contribute. Reported
+percentiles use the sorted sample at floor((n-1)*q); samples are normalized rows,
+so multi-level messages can contribute more than one sample.
+
+Empty book sides and clean collector stops are informational. The report includes
+row counts, observed asset count, timestamp statistics, and source locations for
+row-level findings. It also warns when a subscribed asset has no snapshot anywhere
+in this dataset. That coverage check is dataset-wide, not a guarantee that each
+subscription session received every required snapshot. Without subscription notes,
+the expected universe is unknown.
+
+Malformed records prevent replay instead of allowing misleading book results.
+`replay_checked` indicates whether replay ran. A report with no errors establishes
+only the checks implemented here. It does not certify gap-free collection, valid
+ticks, trade/book consistency, correct settlement metadata, or agreement with
+REST snapshots/on-chain fills. Raw-file hashes in the manifest are not rechecked
+against raw storage by this command; derived Parquet hashes are checked.
+
+Like reconstruction, this version loads records and findings into memory and is
+intended for development recordings. Use one normalized dataset from a single
+collector with chronological source filenames. Continuous reporting, bounded-memory
+processing, and external reconciliation remain Level 1 work.
+
+### Validation changelog: November 3, 2026
+
+- Added root-level `validate.py` and `test_validate.py` for dataset integrity,
+  replay consistency, timestamps, collection continuity, and coverage reports.
