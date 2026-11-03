@@ -1,8 +1,9 @@
 """Starter Listener: watch live Polymarket order book changes.
 
 Finds the busiest Polymarket questions (or the questions in one event you name),
-connects to Polymarket's live feed, and prints every change in plain English.
-Press Ctrl+C to stop.
+connects to Polymarket's live feed, prints every change in plain English, and
+saves every message exactly as received to data/raw/polymarket/<day>/<hour>.jsonl
+(see raw_store.py). Press Ctrl+C to stop.
 
     python3 listener.py                     # the 3 busiest questions on Polymarket
     python3 listener.py <event-slug>        # every question in one event, e.g.
@@ -12,10 +13,13 @@ import asyncio
 import json
 import ssl
 import sys
+import time
 
 import certifi
 import httpx
 import websockets
+
+from raw_store import RawStore
 
 HOW_MANY_QUESTIONS = 3
 LIST_URL = "https://gamma-api.polymarket.com/markets"
@@ -83,7 +87,7 @@ def describe(event, names):
     return None
 
 
-async def listen(questions):
+async def listen(questions, store):
     names = {}
     for q in questions:
         short = q["question"][:45]
@@ -94,7 +98,10 @@ async def listen(questions):
     while True:  # if the line drops, call back
         try:
             async with websockets.connect(LIVE_URL, ssl=secure, max_size=None) as line:
-                await line.send(json.dumps({"type": "market", "assets_ids": list(names), "initial_dump": True}))
+                store.write("connected", {"url": LIVE_URL})
+                request = {"type": "market", "assets_ids": list(names), "initial_dump": True}
+                await line.send(json.dumps(request))
+                store.write("subscribed", {"request": request, "questions": questions})
                 print("Connected. Listening... (press Ctrl+C to stop)\n")
 
                 async def say_still_here():  # Polymarket hangs up without this every 10 seconds
@@ -105,8 +112,10 @@ async def listen(questions):
                 pinger = asyncio.create_task(say_still_here())
                 try:
                     async for message in line:
+                        received = time.time_ns()  # note the arrival time before doing anything else
                         if message == "PONG":
                             continue
+                        store.write("message", message, received)
                         data = json.loads(message)
                         for event in data if isinstance(data, list) else [data]:
                             text = describe(event, names)
@@ -115,6 +124,7 @@ async def listen(questions):
                 finally:
                     pinger.cancel()
         except (websockets.ConnectionClosed, OSError) as problem:
+            store.write("disconnected", {"reason": str(problem)})
             print(f"\nLine dropped ({problem}). Calling back in 3 seconds...\n")
             await asyncio.sleep(3)
 
@@ -129,10 +139,15 @@ def main():
     for q in questions:
         print(f"  - {q['question']}")
     print()
+    store = RawStore("polymarket")
+    print(f"Saving every message under {store.folder}\n")
     try:
-        asyncio.run(listen(questions))
+        asyncio.run(listen(questions, store))
     except KeyboardInterrupt:
-        print("\nStopped. Bye!")
+        store.write("stopped", {"reason": "Ctrl+C"})
+        print(f"\nStopped. Saved {store.lines_written} lines. Bye!")
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":
