@@ -15,11 +15,13 @@ Each line is a JSON object:
 - raw: the exact text the exchange sent. Never parsed or changed here, so a
   bug in later code can always be fixed by re-reading these files.
 
-Big, bursty sources (like the full market list) can use compress=True, which
-writes <hour>.jsonl.gz instead (about 10x smaller; read it with gzip.open).
+compress=True writes <hour>.jsonl.gz instead (about 7 to 15x smaller; read it with
+gzip.open). The live Polymarket feed needs this: about 2.3 GB an hour uncompressed
+for 100 markets.
 
-Files are only ever appended to. Each line is flushed straight to disk so a crash
-loses at most the line being written.
+Files are only ever appended to. Plain files are flushed after every line. Compressed
+files are flushed at most once a second (flushing every line would ruin the
+compression), so a crash loses at most about one second of data.
 """
 import gzip
 import json
@@ -37,6 +39,7 @@ class RawStore:
         self.current_path = None
         self.file = None
         self.lines_written = 0
+        self.last_flush = 0.0
 
     def _file_for(self, recv_ts_ns):
         moment = datetime.fromtimestamp(recv_ts_ns / 1e9, tz=timezone.utc)
@@ -60,7 +63,10 @@ class RawStore:
         line = json.dumps({"recv_ts_ns": recv_ts_ns, "kind": kind, "raw": raw}, ensure_ascii=False)
         f = self._file_for(recv_ts_ns)
         f.write(line + "\n")
-        f.flush()
+        now = time.monotonic()
+        if not self.compress or now - self.last_flush >= 1.0:
+            f.flush()
+            self.last_flush = now
         self.lines_written += 1
 
     def close(self):

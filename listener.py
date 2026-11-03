@@ -1,19 +1,34 @@
-"""Starter Listener: watch live Polymarket order book changes.
+"""Polymarket Listener: watch every picked market live, save every message, never quit.
 
-Finds the busiest Polymarket questions (or the questions in one event you name),
-connects to Polymarket's live feed, prints every change in plain English, and
-saves every message exactly as received to data/raw/polymarket/<day>/<hour>.jsonl
-(see raw_store.py). Press Ctrl+C to stop.
+Reads the market list made by pick_markets.py (data/universe/polymarket/current.json),
+connects to Polymarket's live feed, and saves every message exactly as received to
+data/raw/polymarket/<day>/<hour>.jsonl.gz (compressed; see raw_store.py). Press Ctrl+C to stop.
 
-    python3 listener.py                     # the 3 busiest questions on Polymarket
-    python3 listener.py <event-slug>        # every question in one event, e.g.
+    python3 listener.py                     # every market in current.json (the normal way)
+    python3 listener.py --verbose           # same, and print every change in plain English
+    python3 listener.py <event-slug>        # just the questions in one event, e.g.
     python3 listener.py laliga-2027-champion-20260701200737375
+
+Staying alive:
+- Polymarket allows at most 500 tokens per connection, so the tokens are split
+  across as many connections as needed (MAX_TOKENS_PER_CONNECTION each).
+- If a connection drops, or goes silent for SILENCE_LIMIT seconds, it reconnects
+  (waiting 1, 2, 4 ... up to 60 seconds between tries) and asks for a fresh full
+  copy of every book, so nothing is built on a stale book.
+- Every REPICK_EVERY_HOURS it runs pick_markets.py in the background (the old list
+  keeps being saved meanwhile), then switches to the new list. Markets that closed
+  drop out and newly busy markets come in.
+- Every connect, subscribe, drop and list switch is written to the raw files as a
+  note, so later we can tell a quiet market apart from a time we were offline.
 """
 import asyncio
 import json
 import ssl
+import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import certifi
 import httpx
@@ -21,29 +36,32 @@ import websockets
 
 from raw_store import RawStore
 
-HOW_MANY_QUESTIONS = 3
-LIST_URL = "https://gamma-api.polymarket.com/markets"
+HERE = Path(__file__).resolve().parent
+UNIVERSE_FILE = HERE / "data" / "universe" / "polymarket" / "current.json"
+PICKER = HERE / "pick_markets.py"
+PICKER_LOG = HERE / "data" / "logs" / "pick_markets.log"
 EVENT_URL = "https://gamma-api.polymarket.com/events"
 LIVE_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
+MAX_TOKENS_PER_CONNECTION = 400  # Polymarket's limit is 500; stay under it
+SILENCE_LIMIT = 30  # seconds. We PING every 10s and Polymarket answers, so 30s of nothing = dead line
+REPICK_EVERY_HOURS = 24
+STATUS_EVERY = 60  # seconds between status lines
 
-def pick_busiest_questions():
-    """Ask Polymarket for its busiest open questions and grab their YES/NO name tags."""
-    reply = httpx.get(
-        LIST_URL,
-        params={"closed": "false", "order": "volume24hr", "ascending": "false", "limit": 20},
-        timeout=20,
-    )
-    reply.raise_for_status()
-    questions = []
-    for market in reply.json():
-        if not market.get("enableOrderBook") or not market.get("clobTokenIds"):
-            continue
-        yes_tag, no_tag = json.loads(market["clobTokenIds"])
-        questions.append({"question": market["question"], "yes": yes_tag, "no": no_tag})
-        if len(questions) == HOW_MANY_QUESTIONS:
-            break
-    return questions
+SECURE = ssl.create_default_context(cafile=certifi.where())
+
+
+# ---------- which tokens to watch ----------
+
+def load_universe():
+    """Read current.json. Returns ({token_id: label}, picked_at)."""
+    universe = json.loads(UNIVERSE_FILE.read_text())
+    names = {}
+    for market in universe["markets"]:
+        for outcome in market["outcomes"]:
+            names[outcome["token_id"]] = f"{outcome['name'][:10]:<10} | {market['question'][:45]}"
+    picked_at = datetime.fromisoformat(universe["picked_at"])
+    return names, picked_at
 
 
 def questions_in_event(slug):
@@ -55,18 +73,24 @@ def questions_in_event(slug):
         sys.exit(f"Polymarket has no event called '{slug}'. Copy the part after polymarket.com/event/ in its link.")
     event = events[0]
     print(f"Event: {event['title']}")
-    questions = []
+    names = {}
     for market in event.get("markets", []):
         if market.get("closed") or not market.get("enableOrderBook") or not market.get("clobTokenIds"):
             continue
         yes_tag, no_tag = json.loads(market["clobTokenIds"])
-        label = market.get("groupItemTitle") or market["question"]
-        questions.append({"question": label, "yes": yes_tag, "no": no_tag})
-    return questions
+        label = (market.get("groupItemTitle") or market["question"])[:45]
+        names[yes_tag] = f"YES        | {label}"
+        names[no_tag] = f"NO         | {label}"
+    return names
 
+
+def split_into_connections(tokens):
+    return [tokens[i:i + MAX_TOKENS_PER_CONNECTION] for i in range(0, len(tokens), MAX_TOKENS_PER_CONNECTION)]
+
+
+# ---------- plain-English printing (only with --verbose) ----------
 
 def describe(event, names):
-    """Turn one Polymarket message into a plain-English line."""
     kind = event.get("event_type")
     if kind == "book":
         name = names.get(event["asset_id"], "?")
@@ -87,65 +111,156 @@ def describe(event, names):
     return None
 
 
-async def listen(questions, store):
-    names = {}
-    for q in questions:
-        short = q["question"][:45]
-        names[q["yes"]] = f"YES | {short}"
-        names[q["no"]] = f"NO  | {short}"
+def clock():
+    return datetime.now().strftime("%H:%M:%S")
 
-    secure = ssl.create_default_context(cafile=certifi.where())
-    while True:  # if the line drops, call back
+
+# ---------- the collector ----------
+
+class Collector:
+    def __init__(self, store, verbose):
+        self.store = store
+        self.verbose = verbose
+        self.names = {}
+        self.live = set()  # connection numbers currently connected
+        self.saved = 0
+        self.drops = 0
+
+    async def connection(self, number, tokens):
+        """Keep one connection alive forever for this group of tokens."""
+        wait = 1
+        while True:
+            try:
+                async with websockets.connect(LIVE_URL, ssl=SECURE, max_size=None) as line:
+                    self.store.write("connected", {"connection": number, "url": LIVE_URL})
+                    # initial_dump: Polymarket sends a full fresh book for every token first
+                    request = {"type": "market", "assets_ids": tokens, "initial_dump": True}
+                    await line.send(json.dumps(request))
+                    self.store.write("subscribed", {"connection": number, "request": request})
+                    self.live.add(number)
+                    wait = 1
+
+                    async def say_still_here():  # Polymarket hangs up without this
+                        while True:
+                            await asyncio.sleep(10)
+                            await line.send("PING")
+
+                    pinger = asyncio.create_task(say_still_here())
+                    try:
+                        while True:
+                            message = await asyncio.wait_for(line.recv(), SILENCE_LIMIT)
+                            received = time.time_ns()  # arrival time first, before anything else
+                            if message == "PONG":
+                                continue
+                            self.store.write("message", message, received)
+                            self.saved += 1
+                            if self.verbose:
+                                self.print_message(message)
+                    finally:
+                        pinger.cancel()
+                        self.live.discard(number)
+            except (websockets.WebSocketException, OSError, asyncio.TimeoutError) as problem:
+                reason = f"no data for {SILENCE_LIMIT} seconds" if isinstance(problem, TimeoutError) else str(problem) or type(problem).__name__
+                self.store.write("disconnected", {"connection": number, "reason": reason})
+                self.drops += 1
+                print(f"[{clock()}] Connection {number} dropped ({reason}). Reconnecting in {wait}s...")
+                await asyncio.sleep(wait)
+                wait = min(wait * 2, 60)
+
+    def print_message(self, message):
         try:
-            async with websockets.connect(LIVE_URL, ssl=secure, max_size=None) as line:
-                store.write("connected", {"url": LIVE_URL})
-                request = {"type": "market", "assets_ids": list(names), "initial_dump": True}
-                await line.send(json.dumps(request))
-                store.write("subscribed", {"request": request, "questions": questions})
-                print("Connected. Listening... (press Ctrl+C to stop)\n")
+            data = json.loads(message)
+        except ValueError:
+            return
+        for event in data if isinstance(data, list) else [data]:
+            text = describe(event, self.names) if isinstance(event, dict) else None
+            if text:
+                print(text)
 
-                async def say_still_here():  # Polymarket hangs up without this every 10 seconds
-                    while True:
-                        await asyncio.sleep(10)
-                        await line.send("PING")
+    async def status(self, total_connections):
+        last = self.saved
+        while True:
+            await asyncio.sleep(STATUS_EVERY)
+            print(f"[{clock()}] {len(self.live)}/{total_connections} connections up | "
+                  f"{self.saved:,} messages saved ({self.saved - last:,} in the last minute) | drops so far: {self.drops}")
+            last = self.saved
 
-                pinger = asyncio.create_task(say_still_here())
-                try:
-                    async for message in line:
-                        received = time.time_ns()  # note the arrival time before doing anything else
-                        if message == "PONG":
-                            continue
-                        store.write("message", message, received)
-                        data = json.loads(message)
-                        for event in data if isinstance(data, list) else [data]:
-                            text = describe(event, names)
-                            if text:
-                                print(text)
-                finally:
-                    pinger.cancel()
-        except (websockets.ConnectionClosed, OSError) as problem:
-            store.write("disconnected", {"reason": str(problem)})
-            print(f"\nLine dropped ({problem}). Calling back in 3 seconds...\n")
-            await asyncio.sleep(3)
+    async def run(self, names):
+        """Watch these tokens until cancelled."""
+        self.names = names
+        groups = split_into_connections(list(names))
+        print(f"[{clock()}] Watching {len(names)} tokens over {len(groups)} connection(s).")
+        tasks = [asyncio.create_task(self.connection(i + 1, g)) for i, g in enumerate(groups)]
+        tasks.append(asyncio.create_task(self.status(len(groups))))
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
+
+# ---------- daily re-pick ----------
+
+async def next_universe(picked_at):
+    """Wait until the list is REPICK_EVERY_HOURS old, re-pick in the background, return the new list."""
+    while True:
+        age = (datetime.now(timezone.utc) - picked_at).total_seconds()
+        await asyncio.sleep(max(0, REPICK_EVERY_HOURS * 3600 - age))
+        print(f"[{clock()}] Market list is {REPICK_EVERY_HOURS}h old. Re-picking in the background "
+              f"(about 10 minutes; still saving meanwhile). Log: {PICKER_LOG}")
+        PICKER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(PICKER_LOG, "a") as log:
+            picker = await asyncio.create_subprocess_exec(
+                sys.executable, str(PICKER), stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
+            code = await picker.wait()
+        if code == 0:
+            return load_universe()
+        print(f"[{clock()}] Re-pick failed (see {PICKER_LOG}). Keeping the old list, trying again in 1 hour.")
+        picked_at = datetime.now(timezone.utc) - timedelta(hours=REPICK_EVERY_HOURS - 1)  # due again in 1 hour
+
+
+async def watch_universe(collector):
+    names, picked_at = load_universe()
+    while True:
+        print(f"[{clock()}] Using the market list picked at {picked_at:%Y-%m-%d %H:%M} UTC.")
+        watching = asyncio.create_task(collector.run(names))
+        new_names, new_picked_at = await next_universe(picked_at)
+        added, removed = set(new_names) - set(names), set(names) - set(new_names)
+        collector.store.write("universe_changed", {
+            "picked_at": new_picked_at.isoformat(), "tokens_added": sorted(added), "tokens_removed": sorted(removed)})
+        print(f"[{clock()}] New list: {len(added)} tokens added, {len(removed)} removed. Switching over.")
+        # Polymarket has no "unsubscribe", so switching means reconnecting with the new list
+        watching.cancel()
+        await asyncio.gather(watching, return_exceptions=True)
+        names, picked_at = new_names, new_picked_at
+
+
+# ---------- start ----------
 
 def main():
-    if len(sys.argv) > 1:
+    args = [a for a in sys.argv[1:] if a != "--verbose"]
+    verbose = "--verbose" in sys.argv[1:]
+    store = RawStore("polymarket", compress=True)  # ~2.3 GB/hour uncompressed for 100 markets
+    collector = Collector(store, verbose)
+
+    if args:
         print("Asking Polymarket for that event...")
-        questions = questions_in_event(sys.argv[1])
+        names = questions_in_event(args[0])
+        job = collector.run(names)
     else:
-        print("Asking Polymarket for its busiest questions...")
-        questions = pick_busiest_questions()
-    for q in questions:
-        print(f"  - {q['question']}")
-    print()
-    store = RawStore("polymarket")
-    print(f"Saving every message under {store.folder}\n")
+        if not UNIVERSE_FILE.exists():
+            print("No market list yet. Running pick_markets.py first (about 10 minutes)...")
+            subprocess.run([sys.executable, str(PICKER)], check=True, cwd=HERE)
+        job = watch_universe(collector)
+
+    print(f"Saving every message under {store.folder}")
+    print("Press Ctrl+C to stop.\n")
     try:
-        asyncio.run(listen(questions, store))
+        asyncio.run(job)
     except KeyboardInterrupt:
         store.write("stopped", {"reason": "Ctrl+C"})
-        print(f"\nStopped. Saved {store.lines_written} lines. Bye!")
+        print(f"\nStopped. Saved {collector.saved:,} messages. Bye!")
     finally:
         store.close()
 
