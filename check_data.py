@@ -141,7 +141,7 @@ class Book:
         self.asks = {}
         self.tick = None
         self.started = False  # only trust it after a full "book" message on the current connection
-        self.history = deque(maxlen=20000)  # (exchange time, side, price, size before) so we can rewind
+        self.history = deque(maxlen=20000)  # (exchange time, side, price, size before, size after) to rewind or replay
         self.replaced_at = 0  # exchange time of the last full book
         self.last_stamp = 0  # exchange time of the latest update applied
 
@@ -155,7 +155,7 @@ class Book:
 
     def change(self, side, price, size, stamp=0):
         levels = self.bids if side == "BUY" else self.asks
-        self.history.append((stamp, side, price, levels.get(price)))
+        self.history.append((stamp, side, price, levels.get(price), size))
         if size == 0:
             levels.pop(price, None)
         else:
@@ -168,7 +168,7 @@ class Book:
         if stamp < self.replaced_at:
             return None
         bids, asks = dict(self.bids), dict(self.asks)
-        for when_, side, price, before in reversed(self.history):
+        for when_, side, price, before, _after in reversed(self.history):
             if when_ <= stamp:
                 break
             levels = bids if side == "BUY" else asks
@@ -180,6 +180,16 @@ class Book:
             if len(self.history) == self.history.maxlen:
                 return None  # older changes were already forgotten
         return bids, asks
+
+    def resync(self, bids, asks, stamp):
+        """Make the book match a trusted copy taken at exchange time `stamp`, then replay our own
+        later changes on top (they happened after the copy was taken)."""
+        later = [(when_, side, price, after) for when_, side, price, _before, after in self.history if when_ > stamp]
+        self.bids, self.asks = dict(bids), dict(asks)
+        self.history.clear()
+        self.replaced_at = self.last_stamp = stamp
+        for when_, side, price, after in later:
+            self.change(side, price, after, when_)
 
     def best_bid(self):
         return max(self.bids) if self.bids else None
