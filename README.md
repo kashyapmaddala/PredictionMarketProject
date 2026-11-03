@@ -686,10 +686,11 @@ with source context; no partial dataset is published.
 
 ### Remaining scope
 
-This increment does not implement Gamma market/event/outcome normalization,
-Kalshi, reconstruction, tick-aware validation, trade reconciliation, or daily
+This normalization increment does not implement Gamma market/event/outcome normalization,
+Kalshi, tick-aware validation, trade reconciliation, or daily
 quality reports. It performs no metadata join, so no future metadata is attached
 to older observations. Future metadata joins must use when records were known.
+The initial reconstruction implementation is described in Section 16.
 
 The collector currently records connection IDs on lifecycle notes but not on
 exchange frames. A future collector change should attach a connection/session
@@ -732,3 +733,53 @@ and combo/RFQ verification remains outstanding.
 - Consolidated normalization into root-level scripts and documentation into this
   README to retain the repository's existing flat layout. The Section 11.2 layout
   remains a future suggestion, not the current implementation.
+
+## 16. Replaying Order Books
+
+```sh
+python reconstruct.py data/clean/2026-11-03-v1
+python -m pytest -q test_normalize.py test_reconstruct.py
+```
+
+`reconstruct.py` verifies the normalized dataset's Parquet hashes against its
+manifest, replays records, and prints final books and replay issues as JSON.
+It does not modify the input dataset. Use one output of the normalizer from a
+single collector. Records are sorted in memory, so this first implementation
+is intended for development recordings, not multi-week archives.
+
+Capture order is `(source_file, source_line, event_index, change_index)`.
+Source filenames must be chronological, as in the existing day/hour layout.
+Do not combine independently normalized datasets with overlapping relative source
+paths. Neither exchange timestamps nor receive clocks override file capture
+order. Duplicate positions are rejected.
+
+Books are keyed by venue, market ID, and asset ID. Snapshots replace both sides;
+updates set absolute sizes; zero deletes a level. Trades do not separately
+subtract volume. Prices and quantities use Decimal arithmetic. Missing sides
+produce null quotes, spreads, and midpoints. Locked or crossed books are flagged
+and their spread and midpoint are withheld.
+
+An update before a snapshot is reported and ignored. Reconnects, disconnects,
+subscription changes, and unsupported exchange messages invalidate existing books
+for that venue, because exchange frames currently lack connection IDs. Fresh
+snapshots restore synchronization per asset. Invalid books expose no quotes or
+levels, avoiding accidental use of stale data. A clean `stopped` event preserves
+the last historical book and its original timestamps. Separate `collection_status`
+and `collection_status_recv_ts_ns` fields describe the last recorded lifecycle
+event, not current connectivity. Stopping never restores an already invalid book.
+Updates after a stop require a new collection session and snapshot.
+
+For step-by-step inspection in Python, use `Reconstructor.apply(table, row)`
+on ordered records and inspect `engine.result()` after the desired event.
+`synchronized` means a snapshot and uninterrupted supported replay are available;
+it does not certify absence of exchange gaps or agreement with REST snapshots.
+Snapshot reconciliation, sequence/gap validation, tick checks, scalable streaming,
+and historical derived-table output remain future work.
+
+### Reconstruction changelog: November 3, 2026
+
+- Added root-level `reconstruct.py` and `test_reconstruct.py` for deterministic
+  offline replay, lifecycle invalidation, quote summaries, and integration tests.
+
+- Corrected clean-stop handling: retain historical quotes and depth while recording
+  collection status separately; disconnects still require a fresh snapshot.
