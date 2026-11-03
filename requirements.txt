@@ -1,3 +1,7 @@
 certifi
 httpx
 websockets
+
+# Normalization and its tests
+pyarrow>=17,<24
+pytest>=8,<10

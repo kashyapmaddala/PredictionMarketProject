@@ -541,9 +541,14 @@ pm-analytics/
 
 ### 11.3 First concrete tasks for Claude Code (Level 1)
 
+Implementation note (November 3, 2026): the first offline Polymarket WebSocket
+normalizer is available. See [the schema and run instructions](#15-running-the-normalizer-polymarket-ws-v1)
+for supported messages, Parquet output, tests, and remaining scope. This is a
+partial Level 1 implementation; Section 7.8's completion criteria still apply.
+
 1. Scaffold the repo (layout above), `pyproject.toml`, linting, pytest.
-2. Read current Kalshi and Polymarket API docs; write `docs/venue_notes.md` summarizing endpoints, auth, message formats, sequence semantics, book representation, fees, rate limits, combo/RFQ availability, with the date verified.
-3. Define the shared schema in `docs/schema.md` and as typed models (e.g., dataclasses or pydantic).
+2. Read current Kalshi and Polymarket API docs; record venue notes in this README summarizing endpoints, auth, message formats, sequence semantics, book representation, fees, rate limits, combo/RFQ availability, with the date verified.
+3. Define the shared schema in this README and as typed models (e.g., dataclasses or pydantic).
 4. Build the raw-store writer (append-only, partitioned, compressed).
 5. Build the Kalshi WebSocket collector (snapshot + deltas + trades), with reconnect/resync.
 6. Build the Polymarket WebSocket collector, same requirements.
@@ -608,4 +613,122 @@ pm-analytics/
 
 ---
 
-*Last updated: October 4, 2026. Update this file whenever a decision changes, and record the change in `docs/changelog.md`.*
+*Last updated: October 4, 2026. Update this file whenever a decision changes, and record the change in the implementation changelog below.*
+
+
+---
+
+## 15. Running the Normalizer (polymarket-ws-v1)
+
+This is the first Level 1 normalization increment, following README Sections
+7.3 and 11.3. It reads the existing collector envelope without changing raw
+files or the collector. Python 3.11+ is required.
+
+### Run
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pytest test_normalize.py
+.venv/bin/python normalize.py data/raw/polymarket/2026-11-02 data/clean/2026-11-02-v1
+```
+
+Use closed files only, under a root containing only Polymarket WebSocket data.
+Plain JSONL and gzip JSONL are supported. Do not point this command at the
+Gamma metadata directory. The batch checks source hashes before and after
+reading to catch concurrent changes, but this is not a live-file tailer.
+
+Output is `<table>/venue=polymarket/date=YYYY-MM-DD/part-00000.parquet`.
+The date uses receive time in UTC. A manifest contains source hashes, output
+hashes, version and row counts. Publication uses a staging directory and rename.
+Identical reruns are a no-op after verification. Changed inputs or output require
+a new destination; no raw or existing derived data is overwritten. Query one
+published dataset at a time to avoid counting overlapping rebuilds twice.
+
+### Common fields
+
+Every row carries `normalizer_version`, `venue`, `source_file` (relative to the
+input root), `source_line` (one-based), `event_index` (zero-based within a frame),
+and `recv_ts_ns` (integer UTC Unix nanoseconds). Market rows also carry
+`exchange_ts_ns` (nullable, milliseconds converted to nanoseconds), `market_id`
+(Polymarket condition ID, not Gamma numeric ID), and `asset_id` (outcome trading
+identifier). YES and NO books must remain separate by asset ID.
+
+Source location plus event index identifies an observation, not a unique
+exchange trade. Delta rows additionally use `change_index`. Preserve capture
+order when replaying. Exchange timestamps alone cannot order tied events.
+No sequence number is synthesized; a hash is not a sequence number.
+
+### Tables
+
+- `books_snapshots`: one row per full asset snapshot, with `bids` and `asks`
+  as lists of price/size structs and nullable `book_hash`. Empty books are
+  retained because they reset previous state.
+- `book_deltas`: one row per price change, with `side` (`bid` or `ask`), `price`,
+  `new_size`, `change_index`, and nullable `book_hash`. New size is absolute,
+  not additive; zero means remove the level.
+- `trades`: last-trade observations with `price`, nullable `size`,
+  `reported_side`, and nullable `transaction_hash`. No unique trade ID or
+  verified taker side is invented. Do not use these rows for VPIN without
+  separate direction verification and reconciliation.
+- `collector_events`: non-message envelopes, preserving `kind` and JSON
+  `payload`, including reconnect and subscription notes.
+- `unsupported_events`: other exchange events, preserving their type and JSON
+  payload. Tick-size and lifecycle events currently appear here. Monitor this
+  table rather than assuming complete message coverage.
+
+Prices and quantities are exact decimal strings in Parquet, avoiding implicit
+binary floating-point conversion or an unverified fixed scale. Convert explicitly
+to a suitable DECIMAL type for arithmetic. Parsing rejects negative, nonfinite,
+and out-of-range prices. Endpoints 0 and 1 are preserved for later quality
+checks, not clipped by normalization. Malformed known messages fail the batch
+with source context; no partial dataset is published.
+
+### Remaining scope
+
+This increment does not implement Gamma market/event/outcome normalization,
+Kalshi, reconstruction, tick-aware validation, trade reconciliation, or daily
+quality reports. It performs no metadata join, so no future metadata is attached
+to older observations. Future metadata joins must use when records were known.
+
+The collector currently records connection IDs on lifecycle notes but not on
+exchange frames. A future collector change should attach a connection/session
+identifier to every frame so reconstruction can reliably invalidate affected
+books on reconnect. Existing captures cannot fully recover that information.
+
+Parquet byte reproducibility is tested within one dependency environment.
+Pin dependency versions for archived production runs; library upgrades can
+change encoding even if logical rows remain equivalent.
+
+### Venue verification notes
+
+Checked November 3, 2026 against the official
+[real-time data documentation](https://docs.polymarket.com/market-data/realtime-data).
+The README's legacy market-channel documentation URL redirects to this page.
+
+The API section still shows direct wire messages using `event_type`, `market`,
+`asset_id`, and millisecond timestamps. Those are the messages our collector
+stores. SDK payloads use different wrappers and are not accepted by this adapter.
+
+This increment handles book snapshots, price-change arrays, and last-trade
+messages. It retains condition and outcome identifiers separately. Unknown event
+types remain visible in an auxiliary table. No exchange sequence or unique trade
+identifier is assumed. Trade direction needs separate verification before research.
+
+Collector follow-up: the current docs expose unsubscribe frames, while a comment
+in listener.py says unsubscribe is unavailable. This normalization increment does
+not alter collection behavior. Full authentication, limits, fee, metadata, Kalshi,
+and combo/RFQ verification remains outstanding.
+
+### Implementation changelog: November 3, 2026
+
+- Added the first offline Polymarket normalization increment for existing raw
+  WebSocket envelopes: snapshots, absolute-size updates, and trade observations.
+- Added versioned Hive-partitioned Parquet output, source provenance, manifests,
+  atomic batch publication, explicit unsupported events, and normalization tests.
+- Documented scope and remaining Level 1 work in this section. Collection behavior
+  and raw storage format remain unchanged.
+
+- Consolidated normalization into root-level scripts and documentation into this
+  README to retain the repository's existing flat layout. The Section 11.2 layout
+  remains a future suggestion, not the current implementation.
