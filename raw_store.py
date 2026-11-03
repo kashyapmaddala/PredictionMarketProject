@@ -15,9 +15,13 @@ Each line is a JSON object:
 - raw: the exact text the exchange sent. Never parsed or changed here, so a
   bug in later code can always be fixed by re-reading these files.
 
+Big, bursty sources (like the full market list) can use compress=True, which
+writes <hour>.jsonl.gz instead (about 10x smaller; read it with gzip.open).
+
 Files are only ever appended to. Each line is flushed straight to disk so a crash
 loses at most the line being written.
 """
+import gzip
 import json
 import time
 from datetime import datetime, timezone
@@ -27,20 +31,25 @@ DATA_DIR = Path(__file__).resolve().parent / "data" / "raw"
 
 
 class RawStore:
-    def __init__(self, venue):
+    def __init__(self, venue, compress=False):
         self.folder = DATA_DIR / venue
+        self.compress = compress
         self.current_path = None
         self.file = None
         self.lines_written = 0
 
     def _file_for(self, recv_ts_ns):
         moment = datetime.fromtimestamp(recv_ts_ns / 1e9, tz=timezone.utc)
-        path = self.folder / moment.strftime("%Y-%m-%d") / f"{moment:%H}.jsonl"
+        name = f"{moment:%H}.jsonl.gz" if self.compress else f"{moment:%H}.jsonl"
+        path = self.folder / moment.strftime("%Y-%m-%d") / name
         if path != self.current_path:  # a new hour started: move to a new file
             if self.file:
                 self.file.close()
             path.parent.mkdir(parents=True, exist_ok=True)
-            self.file = open(path, "a", encoding="utf-8")
+            if self.compress:  # appending adds a new gzip "member"; gzip.open reads them all as one file
+                self.file = gzip.open(path, "at", encoding="utf-8")
+            else:
+                self.file = open(path, "a", encoding="utf-8")
             self.current_path = path
         return self.file
 
