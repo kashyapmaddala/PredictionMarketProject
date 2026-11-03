@@ -37,20 +37,30 @@ class RawStore:
         self.folder = DATA_DIR / venue
         self.compress = compress
         self.current_path = None
+        self.hour_key = None
         self.file = None
         self.lines_written = 0
         self.last_flush = 0.0
 
     def _file_for(self, recv_ts_ns):
         moment = datetime.fromtimestamp(recv_ts_ns / 1e9, tz=timezone.utc)
+        folder = self.folder / moment.strftime("%Y-%m-%d")
         name = f"{moment:%H}.jsonl.gz" if self.compress else f"{moment:%H}.jsonl"
-        path = self.folder / moment.strftime("%Y-%m-%d") / name
-        if path != self.current_path:  # a new hour started: move to a new file
+        if self.hour_key != (folder, name):  # a new hour started: move to a new file
+            self.hour_key = (folder, name)
+            path = folder / name
+            # Never add onto an existing compressed file: if an earlier run was killed mid-write,
+            # its file has a broken ending, and data added after it is hard to read back.
+            # Start a new part instead: 19.jsonl.gz, 19.part2.jsonl.gz, 19.part3.jsonl.gz ...
+            part = 1
+            while self.compress and path.exists():
+                part += 1
+                path = folder / f"{moment:%H}.part{part}.jsonl.gz"
             if self.file:
                 self.file.close()
             path.parent.mkdir(parents=True, exist_ok=True)
-            if self.compress:  # appending adds a new gzip "member"; gzip.open reads them all as one file
-                self.file = gzip.open(path, "at", encoding="utf-8")
+            if self.compress:
+                self.file = gzip.open(path, "wt", encoding="utf-8")  # always a brand-new file (see above)
             else:
                 self.file = open(path, "a", encoding="utf-8")
             self.current_path = path

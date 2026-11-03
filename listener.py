@@ -20,9 +20,14 @@ Staying alive:
   drop out and newly busy markets come in.
 - Every connect, subscribe, drop and list switch is written to the raw files as a
   note, so later we can tell a quiet market apart from a time we were offline.
+- Every SNAPSHOT_EVERY seconds it also fetches every book straight from Polymarket's
+  REST API and saves the reply (kind "rest_books"). check_data.py compares our
+  rebuilt books against these independent copies.
 """
 import asyncio
+import fcntl
 import json
+import signal
 import ssl
 import subprocess
 import sys
@@ -40,13 +45,17 @@ HERE = Path(__file__).resolve().parent
 UNIVERSE_FILE = HERE / "data" / "universe" / "polymarket" / "current.json"
 PICKER = HERE / "pick_markets.py"
 PICKER_LOG = HERE / "data" / "logs" / "pick_markets.log"
+LOCK_FILE = HERE / "data" / "logs" / "listener.lock"
 EVENT_URL = "https://gamma-api.polymarket.com/events"
 LIVE_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BOOKS_URL = "https://clob.polymarket.com/books"
 
 MAX_TOKENS_PER_CONNECTION = 400  # Polymarket's limit is 500; stay under it
 SILENCE_LIMIT = 30  # seconds. We PING every 10s and Polymarket answers, so 30s of nothing = dead line
 REPICK_EVERY_HOURS = 24
 STATUS_EVERY = 60  # seconds between status lines
+SNAPSHOT_EVERY = 300  # seconds between REST book snapshots (for checking our rebuilt books)
+SNAPSHOT_BATCH = 200  # tokens per REST request
 
 SECURE = ssl.create_default_context(cafile=certifi.where())
 
@@ -125,6 +134,7 @@ class Collector:
         self.live = set()  # connection numbers currently connected
         self.saved = 0
         self.drops = 0
+        self.snapshots_taken = 0
 
     async def connection(self, number, tokens):
         """Keep one connection alive forever for this group of tokens."""
@@ -177,12 +187,29 @@ class Collector:
             if text:
                 print(text)
 
+    async def snapshots(self, tokens):
+        """Every SNAPSHOT_EVERY seconds, fetch every book over REST and save the reply as received."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                await asyncio.sleep(SNAPSHOT_EVERY)
+                for i in range(0, len(tokens), SNAPSHOT_BATCH):
+                    batch = tokens[i:i + SNAPSHOT_BATCH]
+                    try:
+                        reply = await client.post(BOOKS_URL, json=[{"token_id": t} for t in batch])
+                        received = time.time_ns()
+                        reply.raise_for_status()
+                        self.store.write("rest_books", reply.text, received)
+                        self.snapshots_taken += 1
+                    except httpx.HTTPError as problem:
+                        self.store.write("rest_books_failed", {"reason": str(problem) or type(problem).__name__})
+
     async def status(self, total_connections):
         last = self.saved
         while True:
             await asyncio.sleep(STATUS_EVERY)
             print(f"[{clock()}] {len(self.live)}/{total_connections} connections up | "
-                  f"{self.saved:,} messages saved ({self.saved - last:,} in the last minute) | drops so far: {self.drops}")
+                  f"{self.saved:,} messages saved ({self.saved - last:,} in the last minute) | drops so far: {self.drops} | "
+                  f"book snapshots: {self.snapshots_taken}")
             last = self.saved
 
     async def run(self, names):
@@ -192,6 +219,7 @@ class Collector:
         print(f"[{clock()}] Watching {len(names)} tokens over {len(groups)} connection(s).")
         tasks = [asyncio.create_task(self.connection(i + 1, g)) for i, g in enumerate(groups)]
         tasks.append(asyncio.create_task(self.status(len(groups))))
+        tasks.append(asyncio.create_task(self.snapshots(list(names))))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -238,7 +266,25 @@ async def watch_universe(collector):
 
 # ---------- start ----------
 
+def stop_politely(signum, frame):
+    raise KeyboardInterrupt  # treat "pkill" like Ctrl+C, so the "stopped" note gets written
+
+
+def only_one_copy():
+    """Refuse to start if another listener is already running: two copies would save
+    everything twice and could write into the same file at once, which breaks it."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released automatically when this program ends
+    except BlockingIOError:
+        sys.exit("Another listener is already running (check with: pgrep -fl listener.py). Not starting a second copy.")
+    return lock
+
+
 def main():
+    signal.signal(signal.SIGTERM, stop_politely)
+    lock = only_one_copy()  # keep a reference so the lock is held while we run
     args = [a for a in sys.argv[1:] if a != "--verbose"]
     verbose = "--verbose" in sys.argv[1:]
     store = RawStore("polymarket", compress=True)  # ~2.3 GB/hour uncompressed for 100 markets
