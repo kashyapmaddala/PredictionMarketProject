@@ -1,0 +1,30 @@
+{
+  "book_deltas": {
+    "rows": 6758,
+    "sha256": "fa7f0a9cb30f0dcef5f95a4065410848d78729f2045ae398f1a3755a94f7e92f"
+  },
+  "book_snapshots": {
+    "rows": 7930,
+    "sha256": "2baf462e970b51f3e9657a9188eef5e39f7d606a553931953deabffd5fe0afc0"
+  },
+  "collector_events": {
+    "rows": 4,
+    "sha256": "b331c01233bdec0aa36c1d0319c769e190f5a9391fc78a9f35263b2db7514bbe"
+  },
+  "resyncs": {
+    "rows": 0,
+    "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "top_of_book": {
+    "rows": 6492,
+    "sha256": "717f6dd66256dccdaf62832da086297959ba5e43564d1df1918f34948b041330"
+  },
+  "trades": {
+    "rows": 46,
+    "sha256": "5ae4dce20739ee8d04342956a4c24e03b7e7d7c10606e1a1cac1f08632e6e77d"
+  },
+  "unsupported_events": {
+    "rows": 0,
+    "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  }
+}
