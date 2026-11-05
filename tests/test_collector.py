@@ -411,3 +411,27 @@ def test_cli_without_a_market_list_or_with_bad_arguments(tmp_path, monkeypatch):
     paths.universe.mkdir(parents=True)
     paths.universe_file.write_text("{not json")
     assert collect_live.main([]) == 3
+
+
+def test_connect_timeout_is_named_as_such(tmp_path):
+    def hanging_connect(*_a, **_k):
+        class Never:
+            async def __aenter__(self):
+                raise TimeoutError
+
+            async def __aexit__(self, *exc):
+                return False
+        return Never()
+
+    async def main():
+        paths, store, c = make(tmp_path, "ws://127.0.0.1:9")
+        c.connect = hanging_connect
+        task = asyncio.create_task(c.shard(1, [TOKENS[0]], asyncio.Event(), collector_module.Generation({})))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        store.close()
+        return paths
+
+    drops = [e for e in lines(asyncio.run(main())) if e["kind"] == "disconnected"]
+    assert drops and drops[0]["raw"]["reason"] == "timed out while connecting"

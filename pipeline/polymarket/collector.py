@@ -246,7 +246,7 @@ class Collector:
         except StorageFailed:
             raise
         except TimeoutError:
-            reason = f"no data for {s.silence_limit:g} seconds"
+            reason = f"no data for {s.silence_limit:g} seconds" if opened is not None else "timed out while connecting"
         except websockets.ConnectionClosed as problem:
             reason = self.kick_reason.get(conn) or str(problem) or type(problem).__name__
         except (websockets.WebSocketException, OSError) as problem:
