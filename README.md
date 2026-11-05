@@ -1,12 +1,282 @@
-# PROJECT HANDOFF: Prediction Market Volatility and Analytics Platform
+# Prediction Market Volatility and Analytics Platform
 
-> **Read this entire file before writing any code.** It is the single source of truth for what this project is, what has been decided, what has been scrapped, and what comes next. If anything in the codebase conflicts with this file, ask the project lead before changing direction.
+BoilerQuant (Purdue), Fall 2026. Lead: Dhruv Jhamb. Venues: Polymarket, then Kalshi.
+
+We are building the **measurement layer for prediction markets**: our own validated order book data, per-contract microstructure analytics (volatility, liquidity, informed flow) computed from it, and every forecast graded publicly against what actually happened.
+
+This README has two parts:
+
+- **Part I: Engineering.** The system as it exists today: architecture, data contracts, the guarantees we make about the data, how we prove them, how it fails, and the standards every change must meet. Read this before touching code.
+- **Part II: Project plan.** The original handoff: vision, decisions, research directions, reading lists. Read this to understand *why* we are building it.
+
+> **Golden rule.** Everything downstream (features, models, backtests, the public track record) is only as trustworthy as the data pipeline. A wrong number in a clean table becomes a wrong research result months later, silently. So the pipeline is built like production software: tested, versioned, reproducible, and checked against the exchange itself.
 
 ---
 
+# Part I: Engineering
+
+## E1. Status at a glance
+
+Level 1 (the data pipeline) is in progress. It is done when both venues have run two weeks with no unrepaired gaps and our books match the exchange (Section 7.8).
+
+**Polymarket**
+
+| # | Step | Status |
+|---|---|---|
+| 1 | Raw store: every message saved exactly as received | Done |
+| 2 | Universe: pick markets to watch (top 100 by 24h volume, max 5 per event) | Done |
+| 3 | Collector: watch every picked market, reconnect, re-pick daily, never quit | Done |
+| 4 | Validation: rebuild books, compare to the exchange, find gaps | Done |
+| 5 | Normalizer: raw files into versioned Parquet tables, DuckDB query layer | Done |
+| H | **Hardening: test suite, shared core module, exact decimals, CI** | **Next** (see E10) |
+| 6 | Operations: 24/7 server, scheduled normalize + validate, alerts, raw backups | After H |
+| 7 | Outcomes and backfill: resolutions, Polymarket-v1 history, reconciliation | |
+| 8 | Scale: 100, then 500, then 1,000+ markets, with measured capacity | |
+| 9 | Two clean weeks | |
+
+**Kalshi:** not started. Blocked on written permission to store data (their terms) and an API key. Same steps, reusing the shared raw store and core.
+
+## E2. Quick start
+
+Requires Python 3.11+. No Polymarket account is needed (public market data, IP rate limited).
+
+```sh
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+python3 pick_markets.py                 # choose the universe (about 10 min, pulls all ~234k open markets)
+python3 listener.py                     # collect forever (Ctrl+C stops cleanly); --verbose to watch changes
+python3 check_data.py                   # validate everything collected so far; ends with PASS or a problem list
+python3 normalize.py                    # build clean tables for every finished hour
+python3 query.py history "control the House"   # one contract's full history in one DuckDB query
+python3 query.py sql "SELECT count(*) FROM trades"
+```
+
+Data lands in `data/` (never committed). Long-running collection: `nohup python3 -u listener.py >> data/logs/listener.log 2>&1 &`. Only one listener may run at a time; a lock file enforces it.
+
+## E3. Architecture
+
+```
+            Gamma API (all open markets)
+                      │  pick_markets.py: filter tradeable, rank by 24h volume, cap per event
+                      ▼
+            data/universe/polymarket/<UTC>.json, current.json   (universe history kept)
+                      │
+                      ▼
+  CLOB WebSocket ──► listener.py ──────────────► data/raw/polymarket/<day>/<HH>.jsonl.gz
+  (book, price_change,  │  shards 400 tokens/conn      (append-only, exactly as received,
+   last_trade_price,    │  reconnect + fresh books      plus collector notes)
+   tick_size_change)    │  REST /books every 5 min  ──►  (same raw files, kind = rest_books)
+                        │  re-pick every 24h
+                        ▼
+              check_data.py  (validation: replay books, compare to exchange, gaps, sanity)
+                        │    shared Book logic
+                        ▼
+              normalize.py   (deterministic, versioned, idempotent, hourly checkpoints)
+                        │
+                        ▼
+  data/clean/polymarket/<table>/date=YYYY-MM-DD/hour=HH/part.parquet
+                        │
+                        ▼
+              query.py   (DuckDB views over all Parquet)  ──►  Level 2 research
+```
+
+**Layering.** Each layer only reads the layer above it and can be rebuilt from it. Raw is the only irreplaceable layer; everything else is a pure function of raw plus code version.
+
+| Layer | Where | Rebuildable? | Owner |
+|---|---|---|---|
+| Raw | `data/raw/<venue>/` | **No** (back it up) | `listener.py`, `raw_store.py` |
+| Universe | `data/universe/<venue>/` | No (history of what we watched when) | `pick_markets.py` |
+| Clean | `data/clean/<venue>/` | Yes, from raw | `normalize.py` |
+| Reports | `data/reports/<venue>/` | Yes, from raw | `check_data.py` |
+| Features / research (Level 2) | `data/features/`, notebooks | Yes, from clean | future |
+
+**Process model.** One long-running async process (`listener.py`) per venue does all network I/O: one WebSocket task per shard of 400 tokens, a REST snapshot task, a status task, and a background re-pick subprocess. Batch jobs (`check_data.py`, `normalize.py`) are separate processes that only read raw files, so they can run on a schedule without touching collection.
+
+## E4. Repository map
+
+Everything is currently flat at the repo root (scripts, not a package). See E10 for the planned module layout.
+
+| File | Responsibility | Reads | Writes |
+|---|---|---|---|
+| `raw_store.py` | Append-only raw writer, partitioned by venue/UTC day/UTC hour; gzip, flushed once a second; never reopens a finished `.gz` (writes `HH.part2.jsonl.gz` instead) | | `data/raw/` |
+| `pick_markets.py` | Pulls every open market from Gamma `/markets/keyset` with retries and 429 handling; keeps tradeable binary markets; ranks by 24h volume; caps per event; saves the universe and the raw market pages | Gamma API | `data/universe/`, `data/raw/polymarket_markets/` |
+| `listener.py` | The collector: shards tokens across WebSockets, PINGs, 30 s silence timeout, reconnect with 1 to 60 s backoff, fresh books on every connect, REST snapshots every 5 min, daily re-pick, lock file, clean shutdown on SIGTERM/Ctrl+C | CLOB WS + REST, universe | raw via `raw_store` |
+| `check_data.py` | Validation: tolerant raw reader (survives damaged gzip), `Book` reconstruction with history for rewind, all checks in E7, saved report | raw | `data/reports/` |
+| `normalize.py` | Raw into seven Parquet tables (E5), hourly book state checkpoints, REST resync policy, `--rebuild` / `--current` | raw, universe | `data/clean/` |
+| `query.py` | DuckDB views over the clean tables; `markets`, `history`, `sql` commands | clean | |
+| `requirements.txt` | Runtime dependencies | | |
+
+## E5. Data contracts
+
+These are the interfaces between layers. Changing one is a breaking change: it needs a PR that says so, a `NORMALIZER_VERSION` bump (for clean tables), and a rebuild.
+
+### Raw envelope (one JSON object per line)
+
+```json
+{"recv_ts_ns": 1793664000123456789, "kind": "message", "raw": "<exact text the exchange sent>"}
+```
+
+| `kind` | Meaning |
+|---|---|
+| `message` | Exchange frame, untouched (`raw` is a string, never parsed before saving) |
+| `rest_books` | Body of a `POST /books` snapshot response (independent copy for validation) |
+| `connected`, `subscribed`, `disconnected` | Connection lifecycle, with connection number and reason |
+| `universe_changed` | The daily re-pick switched the watched set |
+| `stopped` | Clean shutdown. A restart with no `stopped` before it means a crash, and the gap is counted |
+| `rest_books_failed` | A snapshot request failed (reason saved) |
+
+### Clean tables
+
+Partitioned `date=YYYY-MM-DD/hour=HH` by the UTC receive hour, matching the raw file they came from. Every row carries `venue` and `normalizer_version`.
+
+| Table | Grain (one row per) | Key columns |
+|---|---|---|
+| `book_deltas` | price level that changed | `exchange_ts, recv_ts_ns, token_id, market_id, side, price, new_size` (absolute, 0 removes the level), `reported_best_bid/ask`, `hash` |
+| `book_snapshots` | level in a full book | `snapshot_id, source` (`live` or `rest`), `side, price, size, tick_size` |
+| `trades` | trade observed | `price, size, taker_side, fee_rate_bps, transaction_hash` |
+| `top_of_book` | moment our rebuilt book changed | `best_bid/ask` and sizes, `mid, spread, bid_levels, ask_levels, cause` (`change`, `full_book`, `resync`) |
+| `resyncs` | correction from a disagreeing REST copy | `levels_wrong, example` |
+| `collector_events` | collector note | `kind, details` |
+| `markets` | (token, pick) | question, outcome, event, tick size, neg risk, end date, `picked_at`, rank |
+
+**Units and identity.**
+- `exchange_ts` is exchange time in ms since epoch UTC; `recv_ts_ns` is our receive time in ns. Always keep both (Section 7.2).
+- `token_id` is one outcome's book (YES and NO are separate books). `market_id` is the Polymarket condition ID. Gamma's numeric ID is `gamma_market_id`.
+- Prices are probabilities in [0, 1]. **Known debt:** prices and sizes are float64 today; moving to exact decimals is part of step H.
+- Ordering: exchange timestamps tie (Polymarket batches many changes under one timestamp), so replay order is file order, then line, then position in the message. Never sort by timestamp alone.
+
+## E6. Guarantees (invariants)
+
+The pipeline promises these. Each is enforced in code and, after step H, each has a test.
+
+1. **Raw is append-only and never edited.** Fixing any bug means re-running downstream code, never patching raw.
+2. **Single writer.** A lock file (`data/logs/listener.lock`) stops a second listener; two writers once corrupted an hour of data.
+3. **Crash safety.** At most about one second of data is lost on a crash (gzip flush interval). A crash is detectable (no `stopped` note) and reported as a gap.
+4. **Determinism and idempotence.** The same raw bytes plus the same code version produce byte-identical Parquet (verified by rebuild). Hours are rewritten, never appended.
+5. **Versioning.** Every clean row records `normalizer_version`. Output changes require a bump.
+6. **No silent loss.** Every disconnect, crash, damaged file stretch and REST disagreement appears in a table or report. Nothing is dropped quietly.
+7. **Point-in-time.** Nothing at time *t* may use data from after *t* (Section 0, rule 4). The `markets` table keeps every pick with `picked_at` so metadata can be joined as known at the time.
+
+## E7. Correctness: how we know the data is right
+
+`check_data.py` replays every book from raw and runs:
+
+| Check | What must hold | Latest result (Nov 3, 2026) |
+|---|---|---|
+| Live consistency | After each same-timestamp batch, our best bid/ask equals the `best_bid/best_ask` Polymarket reports in `price_change` | 644,154 of 644,154 (100%) |
+| REST reconciliation | Every 5 min, our full book (every level), rewound to the snapshot's exact exchange timestamp, equals the REST copy | 1,530 of 1,560 (98%) |
+| Sanity | Not crossed, prices in [0, 1] and on tick, sizes positive | Pass |
+| Trades | Price in [0, 1] | Pass |
+| Gaps | Every disconnect, stop and crash restart, with blind duration | All found, including a crash with no stop note |
+| Damage | Unreadable gzip stretches located and measured | One damaged file (Nov 3, 19 UTC) reported |
+
+**Known discrepancy.** The REST misses are mostly one market (Adam Hamilton, 2028 Democratic nomination) where REST shows 11 resting levels the live feed never sent: a Polymarket-side inconsistency. Policy (Section 7.5, "log and resync"): the normalizer corrects the book to the REST copy, replays our later changes on top, and records it in `resyncs`.
+
+**Not yet checked** (Level 1 work): trade-book consistency, on-chain fill reconciliation, Polymarket-v1 spot checks, exchange-to-receive lag percentiles, completeness vs expected trade counts.
+
+## E8. Failure modes
+
+| Failure | Detection | Response |
+|---|---|---|
+| WebSocket drops | Exception or 30 s silence | Reconnect with 1 to 60 s backoff; resubscribe; exchange resends full books; gap logged |
+| Process crash / machine sleep | No `stopped` note before restart | Gap counted in report. Step 6 adds auto-restart and alerts |
+| Second listener started | Lock file | Refuses to start |
+| Damaged gzip (killed mid-write) | Tolerant reader scans for gzip members | Reads past it, reports bytes lost; new runs write part files instead of appending |
+| Book drift from exchange | REST reconciliation | Resync to REST, logged in `resyncs` |
+| Universe change | Daily re-pick | Switch shards; `universe_changed` note; history kept |
+| Gamma rate limit (429) | HTTP status | Retry with backoff |
+| Disk fills | Step 6 alert (planned) | Raw backup to cloud storage, then prune local |
+| Unknown message type | Counted, not tabled yet | Step H: `unsupported_events` table |
+
+## E9. Capacity (measured, 100 markets)
+
+| Metric | Value |
+|---|---|
+| Message rate | about 800 per second |
+| Raw size | 2.3 GB/hour uncompressed, **0.26 GB/hour gzip** (about 6 GB/day, about 90 GB per two weeks) |
+| Collector memory | about 63 MB |
+| Normalize speed | about 4 hours of data in 2 seconds |
+| Full universe pull | about 10 minutes, 95 MB compressed |
+
+Volume concentrates in the most active markets, so 500 or 1,000 markets should grow less than linearly. This is measured before each scale step, never assumed (step 8). The step 6 server needs 100+ GB of disk and backups from day one.
+
+## E10. Engineering standards
+
+Every change, by anyone (human or AI), meets these.
+
+**Workflow**
+- Always branch from the latest `main` (`git fetch` and check open branches first, so nobody builds the same thing twice). Name branches `feature/...`, `fix/...`, `docs/...`.
+- Open a pull request. At least one teammate reviews. `main` must always run.
+- Small PRs, one concern each. Say what changed, why, how it was tested, and whether any data contract changed.
+- Commit messages: imperative summary line, body explains why.
+
+**Code**
+- **Money and probabilities are exact.** Parse prices and sizes with `Decimal` (or exact decimal Parquet types), never accumulate floats.
+- **Pure core, thin scripts.** Book logic, parsing and schemas live in importable modules with no I/O side effects; scripts only wire arguments, files and network.
+- **No mutable globals.** Pass state explicitly.
+- **One config.** Paths, URLs and limits are defined once.
+- **Fail loud on contract violations, tolerate exchange noise.** Malformed raw lines are counted and reported; a schema mismatch in our own output stops the job.
+- Type hints on public functions. `ruff` for lint and format. Logging with timestamps and levels, not print, for anything that runs unattended.
+- Dependencies pinned (`requirements.txt` with exact versions; byte-identical Parquet depends on them).
+- Secrets (Kalshi keys) only in environment variables or an untracked `.env`. Data never goes in git.
+
+**Testing** (pytest, run in CI on every PR)
+- **Unit:** book apply/remove/resync/rewind, tolerant gzip reader, part-file naming, universe cap and filters, schema builders.
+- **Regression:** one test per bug we have fixed (same-timestamp batches, REST rewind, damaged gzip, double writer, crash detection).
+- **Golden file:** a small checked-in raw fixture must produce exactly the expected clean tables.
+- **Property:** random snapshot + delta sequences; replaying in pieces with checkpoints equals replaying all at once.
+- **Point-in-time:** any feature or model test that touches data after *t* fails.
+
+**Docs:** this README is updated in the same PR as the change it describes. Decisions that change direction get a dated line in Part II.
+
+### Planned layout (step H)
+
+```
+pm/                        importable package, no side effects on import
+  config.py                paths, URLs, limits (one place)
+  raw/store.py, reader.py  append-only writer; tolerant reader
+  book.py                  order book, rewind, resync (pure)
+  polymarket/parse.py      exchange frames into typed events
+  polymarket/schemas.py    clean table schemas (exact decimals)
+scripts/ or root           listener.py, pick_markets.py, check_data.py, normalize.py, query.py (thin)
+tests/                     unit, regression, golden fixtures, property
+pyproject.toml             ruff, pytest config
+.github/workflows/ci.yml   tests + lint on every PR
+```
+
+### Technical debt (honest list)
+
+| Item | Why it matters | Plan |
+|---|---|---|
+| No automated tests | Fixed bugs can silently return | Step H |
+| float64 prices and sizes | Rounding noise (0.010000000000000009), unsafe for money | Exact decimals, version bump |
+| `normalize.py` imports from `check_data.py` | Core logic trapped in a script | Extract `pm/book.py`, `pm/raw/reader.py` |
+| Global `BROKEN` list in `check_data.py` | Hidden shared state | Return damage from the reader |
+| Paths repeated in 5 files | Drift | `pm/config.py` |
+| No connection ID on exchange frames | Cannot tie a frame to its session | Add to envelope (backward compatible) |
+| Unknown message types only counted | Silent coverage gaps | `unsupported_events` table |
+| `query.py markets` uses the latest pick | Fine for lookup, look-ahead risk in research | Point-in-time join helper |
+| `check_data.py` decompresses whole files in memory and replays all selected days in one pass | Fine at 100 markets; will not be at 1,000+ over weeks | Run per hour from the normalizer's checkpoints |
+
+A teammate's branch (`pipeline/normalization-reconstruction-validation`) independently built tests, exact decimals, manifests and an unsupported-events table. Step H merges those ideas into the main pipeline rather than running two normalizers.
+
+## E11. Contributing
+
+1. Read Part I, then Part II Sections 0, 2 and 7.
+2. Run the quick start against a few minutes of live data.
+3. Pick an item from E1 or the debt table, say so in the team chat, branch from `main`, open a PR.
+4. Questions about direction go to the lead. Questions about code go in the PR.
+
+---
+
+# Part II: Project plan (original handoff)
+
+> Written October 4, 2026 as the single source of truth for what this project is and what comes next. Part I describes what has since been built; where they differ on implementation details (file layout, task list), Part I is current. Decisions and direction below still stand.
+
 ## 0. How to Use This File (instructions for Claude Code)
 
-1. **Current phase:** Level 0 is in progress, and **Level 1 (Data Pipeline) is the next thing to build.** Do not start Level 2 work until Level 1's "done" criteria (Section 7.8) are met, unless the lead explicitly asks.
+1. **Current phase:** Level 0 is done and **Level 1 (Data Pipeline) is in progress** (status in Part I, E1). Do not start Level 2 work until Level 1's "done" criteria (Section 7.8) are met, unless the lead explicitly asks.
 2. **Verify every external API detail before relying on it.** Endpoint URLs, message formats, auth methods, fee formulas, and rate limits in this file were written from research as of **October 2026** and may have changed. Always check the current official Kalshi and Polymarket docs and say so when something differs.
 3. **Data integrity beats speed.** The raw store is append-only and never edited. Every transformation must be reproducible from raw data.
 4. **No look-ahead, ever.** Any model, metric, or forecast computed at time $t$ may only use data with timestamps $\le t$. This is the most important research rule in the project.
@@ -25,7 +295,7 @@
 | **Project lead** | Dhruv Jhamb (applied math, Purdue) |
 | **Team size** | 3 to 5 members (club includes freshmen new to the material) |
 | **Venues** | Kalshi and Polymarket |
-| **Status** | Project approved and presented to the club; team forming; Level 0 underway; Level 1 next |
+| **Status** | Level 0 done; Level 1 in progress (Polymarket steps 1 to 5 built and validated, November 2026) |
 
 ### 1.1 Public description (as presented to the club)
 
@@ -212,7 +482,7 @@ Every member can: (1) explain a live orderbook, (2) explain spread and depth, (3
 
 ---
 
-## 7. Level 1: The Data Pipeline (NEXT TO BUILD)
+## 7. Level 1: The Data Pipeline (IN PROGRESS, see Part I)
 
 **Goal:** clean, validated, continuously updated data from both venues that the team can trust completely.
 
@@ -504,6 +774,8 @@ Product principles:
 
 ### 11.2 Suggested repo layout
 
+> Superseded for now by the planned layout in Part I, E10, which keeps the flat scripts and grows a `pm/` package. Kept here as the long-term target.
+
 ```
 pm-analytics/
 ├── PROJECT_HANDOFF.md        (this file)
@@ -540,6 +812,8 @@ pm-analytics/
 ```
 
 ### 11.3 First concrete tasks for Claude Code (Level 1)
+
+> Historical. Items 4, 6, 7 and most of 8 are done for Polymarket. Current order of work is Part I, E1 and E10.
 
 1. Scaffold the repo (layout above), `pyproject.toml`, linting, pytest.
 2. Read current Kalshi and Polymarket API docs; write `docs/venue_notes.md` summarizing endpoints, auth, message formats, sequence semantics, book representation, fees, rate limits, combo/RFQ availability, with the date verified.
@@ -608,4 +882,4 @@ pm-analytics/
 
 ---
 
-*Last updated: October 4, 2026. Update this file whenever a decision changes, and record the change in `docs/changelog.md`.*
+*Part II last updated October 4, 2026. Part I last updated November 4, 2026. Update this file in the same PR as any change it describes.*
