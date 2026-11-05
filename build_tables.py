@@ -2,7 +2,7 @@
 
 Reads data/raw/polymarket/ (exactly what the exchange sent) and writes Parquet tables to
 data/clean/polymarket/<table>/date=YYYY-MM-DD/hour=HH/part.parquet, one file per UTC hour.
-DuckDB (see query.py) can then search all of them at once.
+DuckDB (see query_data.py) can then search all of them at once.
 
 Tables:
   book_deltas        every change to a book: one row per price level that changed
@@ -21,9 +21,9 @@ Prices and sizes are exact decimals, never floats. Every row has normalizer_vers
 says which raw line it came from (source_file, source_line). The raw files are never changed:
 fixing a bug here means re-running this. Re-running gives byte-identical files.
 
-    python3 normalize.py              # build every finished hour not built yet (or changed)
-    python3 normalize.py --rebuild    # rebuild everything from scratch
-    python3 normalize.py --current    # also build the hour still being written (partial)
+    python3 build_tables.py              # build every finished hour not built yet (or changed)
+    python3 build_tables.py --rebuild    # rebuild everything from scratch
+    python3 build_tables.py --current    # also build the hour still being written (partial)
 """
 import logging
 import sys

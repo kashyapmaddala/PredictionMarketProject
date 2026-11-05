@@ -10,8 +10,8 @@ Nothing is changed: the raw files are only read, so this can be re-run any time.
 small however much data there is. The report is printed and saved to
 data/reports/polymarket/<UTC time>.txt. Exit code 0 = PASS, 1 = problems found.
 
-    python3 check_data.py                  # every saved file
-    python3 check_data.py 2026-11-03       # one UTC day
+    python3 validate_data.py                  # every saved file
+    python3 validate_data.py 2026-11-03       # one UTC day
 """
 import re
 import sys

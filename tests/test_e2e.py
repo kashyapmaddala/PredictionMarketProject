@@ -3,7 +3,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 
-import query as query_cli
+import query_data as query_cli
 from pipeline.config import Paths
 from pipeline.polymarket import query, tables
 from pipeline.polymarket.collector import Collector, run_until_stopped

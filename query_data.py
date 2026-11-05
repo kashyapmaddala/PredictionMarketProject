@@ -1,10 +1,10 @@
 """Search the clean Polymarket tables with DuckDB.
 
-Run normalize.py first; it builds the tables this reads.
+Run build_tables.py first; it builds the tables this reads.
 
-    python3 query.py markets                      # markets we watch, with their token IDs
-    python3 query.py history "house"              # one market's full history (question words or a token ID)
-    python3 query.py sql "SELECT count(*) FROM trades"   # any SQL you like
+    python3 query_data.py markets                      # markets we watch, with their token IDs
+    python3 query_data.py history "house"              # one market's full history (question words or a token ID)
+    python3 query_data.py sql "SELECT count(*) FROM trades"   # any SQL you like
 
 Tables you can use in SQL (all of them have token_id, and exchange_ts in milliseconds UTC):
   book_deltas, book_snapshots, trades, top_of_book, resyncs, collector_events,
@@ -20,7 +20,7 @@ from pipeline.polymarket import query
 def history(db, words):
     found = query.find_tokens(db, words)
     if not found:
-        sys.exit(f"No market matching '{words}'. Try: python3 query.py markets")
+        sys.exit(f"No market matching '{words}'. Try: python3 query_data.py markets")
     token, outcome, question = found[0]
     if len(found) > 1:
         print(f"{len(found)} tokens match; showing the first. Be more specific to pick another.")
@@ -41,7 +41,7 @@ def main(argv=None):
     command = argv[0]
     if command == "markets":
         if "markets" not in query.tables(db):
-            sys.exit("No markets table yet. Run normalize.py first.")
+            sys.exit("No markets table yet. Run build_tables.py first.")
         db.sql("""SELECT rank, outcome, left(question, 70) AS question, token_id
                   FROM markets ORDER BY rank, outcome_index""").show(max_rows=400, max_width=250)
     elif command == "history":

@@ -357,7 +357,7 @@ def start_cli(tmp_path, url, *args):
         "picked_at": datetime.now(UTC).isoformat(),
         "markets": [{"question": "Q", "outcomes": [{"name": "Yes", "token_id": TOKENS[0]}, {"name": "No", "token_id": TOKENS[1]}]}]}))
     env = {**os.environ, "PM_DATA_DIR": str(data), "PM_LIVE_URL": url, "PM_BOOKS_URL": "http://127.0.0.1:9/books"}
-    return subprocess.Popen([sys.executable, str(REPO / "listener.py"), *args], cwd=REPO, env=env,
+    return subprocess.Popen([sys.executable, str(REPO / "collect_live.py"), *args], cwd=REPO, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True), Paths(data)
 
 
@@ -404,10 +404,10 @@ def test_cli_sigterm_writes_stopped_and_second_copy_is_refused(tmp_path):
 
 
 def test_cli_without_a_market_list_or_with_bad_arguments(tmp_path, monkeypatch):
-    import listener
+    import collect_live
     monkeypatch.setenv("PM_DATA_DIR", str(tmp_path / "data"))
-    assert listener.main(["--nope"]) == 1
+    assert collect_live.main(["--nope"]) == 1
     paths = Paths(tmp_path / "data")
     paths.universe.mkdir(parents=True)
     paths.universe_file.write_text("{not json")
-    assert listener.main([]) == 3
+    assert collect_live.main([]) == 3

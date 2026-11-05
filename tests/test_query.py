@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-import query as query_cli
+import query_data as query_cli
 from pipeline.config import Paths
 from pipeline.polymarket import query, tables
 from tests.helpers import TOKEN_A, scripted_session

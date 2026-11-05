@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-import check_data
+import validate_data
 from pipeline.config import Paths
 from pipeline.polymarket import tables
 from pipeline.polymarket.validate import save_report, validate
@@ -82,12 +82,12 @@ def test_report_is_saved(paths):
 def test_cli_exit_codes(paths, monkeypatch, capsys):
     monkeypatch.setenv("PM_DATA_DIR", str(paths.data))
     scripted_session(paths.raw, T + 60 * 1_000_000_000)
-    assert check_data.main([]) == 0
+    assert validate_data.main([]) == 0
     assert "RESULT: PASS" in capsys.readouterr().out
-    assert check_data.main(["2026-11-04"]) == 0
+    assert validate_data.main(["2026-11-04"]) == 0
     with pytest.raises(SystemExit):
-        check_data.main(["yesterday"])
+        validate_data.main(["yesterday"])
     store = RawStore(paths.raw, compress=False, session="x")
     store.write("message", "garbage", T + 3600 * 10**9 * 5)
     store.close()
-    assert check_data.main([]) == 1
+    assert validate_data.main([]) == 1

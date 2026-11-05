@@ -1,15 +1,15 @@
-"""Polymarket collector: watch every picked market live, save every message, never quit.
+"""Polymarket live collector: watch every picked market live, save every message, never quit.
 
 Reads the market list made by pick_markets.py (data/universe/polymarket/current.json), connects
 to Polymarket's live feed, and saves every message exactly as received to
 data/raw/polymarket/<day>/<hour>.jsonl.gz (see pipeline/raw_store.py). Stop it with Ctrl+C or
-`pkill -f listener.py` (SIGTERM); either way it writes a "stopped" note and closes its files.
+`pkill -f collect_live.py` (SIGTERM); either way it writes a "stopped" note and closes its files.
 
-    python3 listener.py                     # every market in current.json (the normal way)
-    python3 listener.py --verbose           # same, and print every change in plain English
-    python3 listener.py --standby           # two connections per group (no gap on a drop; 2x disk)
-    python3 listener.py <event-slug>        # just the questions in one event, e.g.
-    python3 listener.py laliga-2027-champion-20260701200737375
+    python3 collect_live.py                     # every market in current.json (the normal way)
+    python3 collect_live.py --verbose           # same, and print every change in plain English
+    python3 collect_live.py --standby           # two connections per group (no gap on a drop; 2x disk)
+    python3 collect_live.py <event-slug>        # just the questions in one event, e.g.
+    python3 collect_live.py laliga-2027-champion-20260701200737375
 
 How it stays alive, and everything it writes, is explained in pipeline/polymarket/collector.py.
 Only one copy can run at a time (a lock file in data/logs). Exit codes: 0 stopped cleanly,

@@ -218,7 +218,7 @@ def test_legacy_subscribe_resets_books():
 
 
 def test_crash_without_a_stopped_note_is_detected():
-    """Regression (2026-11-03): the listener was killed and restarted with no "stopped" note."""
+    """Regression (2026-11-03): the collector (then called listener.py) was killed and restarted with no "stopped" note."""
     engine = run_engine([*legacy_start(), msg([book()], T0_NS + S),
                          msg(price_change(change(), stamp=T0_MS + 2), T0_NS + 2 * S),
                          *legacy_start(T0_NS + 60_000 * S), msg([book()], T0_NS + 60_001 * S)])
