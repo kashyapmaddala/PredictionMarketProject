@@ -91,3 +91,11 @@ def test_cli_exit_codes(paths, monkeypatch, capsys):
     store.write("message", "garbage", T + 3600 * 10**9 * 5)
     store.close()
     assert validate_data.main([]) == 1
+
+
+def test_overlapping_gaps_are_counted_once():
+    from pipeline.polymarket.validate import covered_seconds
+    s = 1_000_000_000
+    assert covered_seconds([]) == 0
+    assert covered_seconds([(0, 10 * s), (5 * s, 12 * s), (20 * s, 21 * s)]) == 13
+    assert covered_seconds([(0, 10 * s), (2 * s, 3 * s)]) == 10

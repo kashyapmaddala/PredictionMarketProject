@@ -81,6 +81,21 @@ def validate(paths: Paths, day: str | None = None) -> Report:
     return result
 
 
+def covered_seconds(intervals: list[tuple[int, int]]) -> float:
+    """Total length of the union of [start, end] intervals in nanoseconds, in seconds."""
+    total, current_start, current_end = 0, None, None
+    for start, end in sorted(intervals):
+        if current_end is None or start > current_end:
+            if current_end is not None:
+                total += current_end - current_start
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    if current_end is not None:
+        total += current_end - current_start
+    return total / 1e9
+
+
 def lag_summary(buckets: Counter) -> str:
     total = sum(buckets.values())
     if not total:
@@ -154,19 +169,18 @@ def render(result: Report) -> tuple[str, bool]:
     outages = sorted(stats.outages, key=lambda o: o.start_ns)
     if not outages:
         out.append("  none")
-    blind_total = 0.0
     for o in outages:
         if o.end_ns is not None:
             blind = (o.end_ns - o.start_ns) / 1e9
-            blind_total += blind
             reconnect = (o.end_ns - o.note_ns) / 1e9
             extra = f", reconnect took {reconnect:,.1f}s" if o.note_ns != o.start_ns else ""
             out.append(f"  {when(o.start_ns)}  blind {blind:,.1f}s{extra}  {o.who}: {o.reason}"
                        + (f" ({o.tokens} tokens)" if o.tokens else ""))
         else:
             out.append(f"  {when(o.start_ns)}  open  {o.who}: {o.reason}")
+    blind_total = covered_seconds([(o.start_ns, o.end_ns) for o in outages if o.end_ns is not None])
     if blind_total:
-        out.append(f"  total blind time: {blind_total:,.1f}s")
+        out.append(f"  total blind time: {blind_total:,.1f}s (overlapping gaps counted once)")
     out += ["", "Exchange-to-receive delay (all events):", lag_summary(stats.lag_buckets)]
 
     damaged = [d for d in result.files.damage if d.kind == "corrupt"]
