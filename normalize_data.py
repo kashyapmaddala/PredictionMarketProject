@@ -21,9 +21,9 @@ Prices and sizes are exact decimals, never floats. Every row has normalizer_vers
 says which raw line it came from (source_file, source_line). The raw files are never changed:
 fixing a bug here means re-running this. Re-running gives byte-identical files.
 
-    python3 build_tables.py              # build every finished hour not built yet (or changed)
-    python3 build_tables.py --rebuild    # rebuild everything from scratch
-    python3 build_tables.py --current    # also build the hour still being written (partial)
+    python3 normalize_data.py              # build every finished hour not built yet (or changed)
+    python3 normalize_data.py --rebuild    # rebuild everything from scratch
+    python3 normalize_data.py --current    # also build the hour still being written (partial)
 """
 import logging
 import sys
@@ -32,7 +32,7 @@ from pipeline import logs
 from pipeline.config import Paths
 from pipeline.polymarket.tables import build
 
-log = logging.getLogger("build_tables")
+log = logging.getLogger("normalize_data")
 
 
 def main(argv=None):

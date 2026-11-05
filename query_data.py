@@ -1,6 +1,6 @@
 """Search the clean Polymarket tables with DuckDB.
 
-Run build_tables.py first; it builds the tables this reads.
+Run normalize_data.py first; it builds the tables this reads.
 
     python3 query_data.py markets                      # markets we watch, with their token IDs
     python3 query_data.py history "house"              # one market's full history (question words or a token ID)
@@ -41,7 +41,7 @@ def main(argv=None):
     command = argv[0]
     if command == "markets":
         if "markets" not in query.tables(db):
-            sys.exit("No markets table yet. Run build_tables.py first.")
+            sys.exit("No markets table yet. Run normalize_data.py first.")
         db.sql("""SELECT rank, outcome, left(question, 70) AS question, token_id
                   FROM markets ORDER BY rank, outcome_index""").show(max_rows=400, max_width=250)
     elif command == "history":

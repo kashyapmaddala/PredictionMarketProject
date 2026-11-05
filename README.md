@@ -77,7 +77,7 @@ Full step tables and the plan are in [PROJECT.md](PROJECT.md#level-1-the-data-pi
                            v
                  validate_data.py   replay books, compare to exchange, find gaps  ---> REPORTS <data>/reports/
                            |
-                 build_tables.py    deterministic, versioned, hourly book checkpoints
+                 normalize_data.py  deterministic, versioned, hourly book checkpoints
                            v
    CLEAN      <data>/clean/polymarket/<table>/date=YYYY-MM-DD/hour=HH/part.parquet
                            |
@@ -92,11 +92,11 @@ Full step tables and the plan are in [PROJECT.md](PROJECT.md#level-1-the-data-pi
 |---|---|---|---|
 | Raw | `<data>/raw/<venue>/` | **No.** Back it up | `collect_live.py`, `pick_markets.py` (market pages) |
 | Universe | `<data>/universe/<venue>/` | No (record of what we watched when) | `pick_markets.py` |
-| Clean | `<data>/clean/<venue>/` | Yes, from raw | `build_tables.py` |
+| Clean | `<data>/clean/<venue>/` | Yes, from raw | `normalize_data.py` |
 | Reports | `<data>/reports/<venue>/` | Yes, from raw | `validate_data.py` |
 | Features, research (future) | not built yet | Yes, from clean | Level 2 |
 
-**Process model.** One long-running async process (`collect_live.py`) per venue does all network I/O: one WebSocket task per shard of 400 tokens, a REST snapshot task, a status task, and a background re-pick that runs `pick_markets.py` as a subprocess every 24 hours. Batch jobs (`validate_data.py`, `build_tables.py`, `query_data.py`) are separate processes that only read files, so they can run any time, or on a schedule, without touching collection. All shared logic (config, raw I/O, the order book, Polymarket parsing and schemas) lives in the importable `pipeline/` package; the root scripts only handle arguments, files and the network.
+**Process model.** One long-running async process (`collect_live.py`) per venue does all network I/O: one WebSocket task per shard of 400 tokens, a REST snapshot task, a status task, and a background re-pick that runs `pick_markets.py` as a subprocess every 24 hours. Batch jobs (`validate_data.py`, `normalize_data.py`, `query_data.py`) are separate processes that only read files, so they can run any time, or on a schedule, without touching collection. All shared logic (config, raw I/O, the order book, Polymarket parsing and schemas) lives in the importable `pipeline/` package; the root scripts only handle arguments, files and the network.
 
 ## Repository layout
 
@@ -105,7 +105,7 @@ Full step tables and the plan are in [PROJECT.md](PROJECT.md#level-1-the-data-pi
 ├── pick_markets.py              CLI: choose the universe
 ├── collect_live.py              CLI: the live collector (was listener.py)
 ├── validate_data.py             CLI: rebuild books and check them (was check_data.py)
-├── build_tables.py              CLI: raw files into clean Parquet tables (was normalize.py)
+├── normalize_data.py            CLI: raw files into clean Parquet tables (was normalize.py)
 ├── query_data.py                CLI: DuckDB search over clean tables (was query.py)
 ├── pipeline/                    importable package, no side effects on import
 │   ├── config.py                every path, URL and limit in one place; PM_DATA_DIR override
@@ -255,12 +255,12 @@ python3 validate_data.py 2026-11-03    # one UTC day (starts from the table buil
 
 Read-only: it never changes raw files. Prints a report, saves it under `reports/polymarket/`, and ends with `RESULT: PASS, no problems found` or a count of problems with up to five examples of each. Exit code 0 on pass and 1 on problems, so a scheduler can alert on it. Streaming with bounded memory: all 63 hours (22 million messages) take about 9 minutes in under 190 MB.
 
-### 4. Build clean tables: `build_tables.py`
+### 4. Normalize into clean tables: `normalize_data.py`
 
 ```sh
-python3 build_tables.py              # every finished UTC hour not built yet
-python3 build_tables.py --rebuild    # delete clean tables and rebuild everything from raw
-python3 build_tables.py --current    # also build the hour still being written (rebuilt again next run)
+python3 normalize_data.py              # every finished UTC hour not built yet
+python3 normalize_data.py --rebuild    # delete clean tables and rebuild everything from raw
+python3 normalize_data.py --current    # also build the hour still being written (rebuilt again next run)
 ```
 
 It logs one line per hour built, then a summary such as `Built 1 hour(s) (46 already up to date) in 20s. Markets table: ... rows.`
@@ -359,7 +359,7 @@ Notes:
 
 ### Changing a contract
 
-The raw envelope and the clean schemas are interfaces. Changing one is a breaking change: the PR must say so, bump `NORMALIZER_VERSION` for clean tables, update this section, and rebuild with `build_tables.py --rebuild`. Raw changes must stay backward compatible, because raw files are never rewritten.
+The raw envelope and the clean schemas are interfaces. Changing one is a breaking change: the PR must say so, bump `NORMALIZER_VERSION` for clean tables, update this section, and rebuild with `normalize_data.py --rebuild`. Raw changes must stay backward compatible, because raw files are never rewritten.
 
 ## Data quality and validation
 
@@ -387,7 +387,7 @@ Sanity and trade checks passed. The gap check found every outage, including a cr
 
 **Known discrepancies.**
 
-- Most of the Nov 3 REST misses are one market (the 2028 Democratic nomination market for Adam Hamilton), where the REST copy shows 11 resting buy levels that the live feed never sent. This is an inconsistency on Polymarket's side. Policy: log and resync. `build_tables.py` corrects the book to the REST copy, replays our later changes on top, and records it in `resyncs`. After one resync the market matched.
+- Most of the Nov 3 REST misses are one market (the 2028 Democratic nomination market for Adam Hamilton), where the REST copy shows 11 resting buy levels that the live feed never sent. This is an inconsistency on Polymarket's side. Policy: log and resync. `normalize_data.py` corrects the book to the REST copy, replays our later changes on top, and records it in `resyncs`. After one resync the market matched.
 - The 12 Nov 5 mismatches (02:36:46 UTC) were **our bug**: a full book stamped 5 ms older than a change we had already applied overwrote it. Now an older full book is checked against our book at its own moment instead. All 86 such books in the data match.
 - REST copies are stamped a few milliseconds off the live feed, and several changes can share one millisecond. A copy now matches if it equals any state of our book within 10 ms. The old code "corrected" correct books in these cases (149 resyncs in v1, 5 in v2 for the same hours).
 - The remaining 136 best-price mismatches across all data are 62 episodes (YES and NO token each) that all clear by themselves on later updates. The ones traced are Polymarket reporting a removed level as the best price. The feed has no sequence numbers, so a missed message cannot be ruled out completely. 15 REST mismatches (0.03%) were corrected by resync and not traced one by one.
@@ -415,7 +415,7 @@ nohup caffeinate -s python3 -u collect_live.py >> data/logs/collector.log 2>&1 &
 | Is it running? | `pgrep -fl collect_live.py` |
 | Follow the log | `tail -f data/logs/collector.log` (Ctrl+C stops watching, not the collector) |
 | Stop it cleanly | `pkill -f collect_live.py` (sends SIGTERM, which writes a `stopped` note) |
-| Fresh tables | `python3 build_tables.py` (by hand until step 6 schedules it hourly) |
+| Fresh tables | `python3 normalize_data.py` (by hand until step 6 schedules it hourly) |
 | Check the data | `python3 validate_data.py <day>` |
 
 **Lock file.** The collector takes an exclusive lock on `<data>/logs/collector.lock` and refuses to start if another copy holds it; the file holds the running PID. The lock is released automatically when the process exits, even after a crash, so a stale lock file on disk is harmless. Raw files are also created exclusively, so two writers can never share one file.
@@ -452,7 +452,7 @@ Volume is concentrated in the busiest markets, so 500 or 1,000 markets may grow 
 | Gamma rate limit (HTTP 429) or errors | Status code | 6 attempts with backoff, honouring `Retry-After`. A repeated page cursor stops the download instead of looping |
 | REST book copy fails | HTTP error | `rest_books_failed` note; collection continues |
 | Disk fills | Write error | Collector stops with exit code 2 instead of looping. Step 6 adds disk alerts and backups |
-| Bug found in clean tables | Tests, validation, review | Fix the code, bump `NORMALIZER_VERSION`, run `build_tables.py --rebuild`. Raw stays as is |
+| Bug found in clean tables | Tests, validation, review | Fix the code, bump `NORMALIZER_VERSION`, run `normalize_data.py --rebuild`. Raw stays as is |
 
 ## Testing
 
@@ -514,13 +514,13 @@ Next for the pipeline: step 6 (24/7 server with scheduled builds and validation,
 
 **`paused for ...s`.** The computer slept (or the program was frozen) that long. Nothing was collected meanwhile. See [Operations](#operations).
 
-**`query_data.py` says a table does not exist.** Run `build_tables.py` first. A table only appears once at least one hour has rows for it.
+**`query_data.py` says a table does not exist.** Run `normalize_data.py` first. A table only appears once at least one hour has rows for it.
 
 **`history` matched several tokens.** It shows the first. Use more words from the question, or pass the token ID from `query_data.py markets`.
 
 **Why are recent minutes missing from the tables?** The hour still being written is skipped unless you pass `--current`.
 
-**Prices look like `0.010000000000000009`.** You are reading tables built before Step H (`normalizer_version` 1, floats). Rebuild with `build_tables.py --rebuild`.
+**Prices look like `0.010000000000000009`.** You are reading tables built before Step H (`normalizer_version` 1, floats). Rebuild with `normalize_data.py --rebuild`.
 
 **Do I need a Polymarket account?** No. Kalshi will need an account, an API key and written permission to store data.
 
