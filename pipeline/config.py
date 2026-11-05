@@ -17,6 +17,8 @@ DATA_DIR_ENV = "PM_DATA_DIR"
 VENUE = "polymarket"
 
 # ---------- Polymarket endpoints ----------
+# The collector's two endpoints can be pointed elsewhere (tests use a local fake server) with the
+# environment variables PM_LIVE_URL and PM_BOOKS_URL; see Settings.from_env in the collector.
 LIVE_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 BOOKS_URL = "https://clob.polymarket.com/books"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets/keyset"
