@@ -538,7 +538,8 @@ class Engine:
         token, stamp = event.token, event.stamp
         self.stats.count["book"] += 1
         self.touch(conn, recv, stamp)
-        self.late(stamp, recv)
+        # No lateness check: a full book is stamped with the time of its last change, not the time
+        # it was sent (the initial dump has books last changed minutes or hours ago)
         books = self.books[conn]
         book = books.get(token)
         self.stats.booked.add(token)

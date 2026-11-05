@@ -323,7 +323,8 @@ def test_clock_going_backwards_and_late_messages_are_reported():
                          msg([book()], T0_NS + 6 * S),  # still behind: the same step, counted once
                          msg([book()], T0_NS + 11 * S),
                          msg([book()], T0_NS + 2000 * S), msg([book()], T0_NS + 100 * S),  # 1.9 s back: a problem
-                         msg([book(stamp=T0_MS)], T0_NS + 60_000 * S)])
+                         msg([book(stamp=T0_MS)], T0_NS + 60_000 * S),  # an old book is not "late"
+                         msg(trade(stamp=T0_MS), T0_NS + 60_001 * S)])  # a trade 60 s old is
     assert engine.stats.warnings[replay.W_CLOCK] == 1
     assert engine.stats.problems[replay.P_CLOCK] == 1
     assert engine.stats.warnings[replay.W_LATE] == 1
