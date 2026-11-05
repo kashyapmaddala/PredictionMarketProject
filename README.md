@@ -1,4 +1,4 @@
-# Prediction Market Data Pipeline
+# PredictionMarket Project
 
 [![CI](https://github.com/kashyapmaddala/PredictionMarketProject/actions/workflows/ci.yml/badge.svg)](https://github.com/kashyapmaddala/PredictionMarketProject/actions/workflows/ci.yml)
 
