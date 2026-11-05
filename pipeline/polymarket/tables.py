@@ -51,43 +51,61 @@ from .schemas import (
 log = logging.getLogger(__name__)
 
 ROW_GROUP = 100_000  # rows per Parquet row group (fixed, so rebuilds are byte-identical)
+CHUNK = 20_000  # rows held as Python tuples before turning them into compact Arrow arrays
 FINISHED_AFTER = timedelta(minutes=2)  # an hour counts as finished this long after it ends
 STATE_FORMAT = 2
 
 
 class HourWriter:
-    """Receives rows from the engine and streams them into one Parquet file per table."""
+    """Receives rows from the engine and streams them into one Parquet file per table.
+
+    Rows arrive as Python tuples (about 1 KB each with their Decimals); every CHUNK rows they are
+    turned into compact Arrow arrays, and every ROW_GROUP rows written out, so memory stays small
+    at any hour size."""
 
     def __init__(self, folder: Path):
         self.folder = folder
         self.buffers: dict[str, list] = {name: [] for name in HOURLY_TABLES}
+        self.chunks: dict[str, list] = {name: [] for name in HOURLY_TABLES}
+        self.chunked: dict[str, int] = dict.fromkeys(HOURLY_TABLES, 0)
         self.writers: dict[str, pq.ParquetWriter] = {}
         self.counts: dict[str, int] = dict.fromkeys(HOURLY_TABLES, 0)
 
     def add(self, table: str, row: tuple) -> None:
         buffer = self.buffers[table]
         buffer.append(row)
-        if len(buffer) >= ROW_GROUP:
-            self.flush(table)
+        if len(buffer) >= CHUNK:
+            self.convert(table)
 
-    def flush(self, table: str) -> None:
+    def convert(self, table: str) -> None:
         rows = self.buffers[table]
         if not rows:
             return
         arrow = to_arrow(table, rows)
         check_table(table, arrow)
+        self.chunks[table].append(arrow)
+        self.chunked[table] += len(rows)
+        self.buffers[table] = []
+        if self.chunked[table] >= ROW_GROUP:
+            self.write(table)
+
+    def write(self, table: str) -> None:
+        if not self.chunks[table]:
+            return
+        arrow = pa.concat_tables(self.chunks[table])
         writer = self.writers.get(table)
         if writer is None:
             path = self.folder / table / "part.parquet"
             path.parent.mkdir(parents=True, exist_ok=True)
             writer = self.writers[table] = pq.ParquetWriter(path, SCHEMAS[table], compression="zstd")
         writer.write_table(arrow, row_group_size=ROW_GROUP)
-        self.counts[table] += len(rows)
-        self.buffers[table] = []
+        self.counts[table] += arrow.num_rows
+        self.chunks[table], self.chunked[table] = [], 0
 
     def close(self) -> dict[str, int]:
         for table in HOURLY_TABLES:
-            self.flush(table)
+            self.convert(table)
+            self.write(table)
         for writer in self.writers.values():
             writer.close()
         self.writers = {}

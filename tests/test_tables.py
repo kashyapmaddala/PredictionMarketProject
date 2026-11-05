@@ -171,3 +171,15 @@ def test_schemas_have_the_version_one_columns_first():
                           "best_ask_size", "mid", "spread", "bid_levels", "ask_levels", "cause"]}
     for name, columns in v1.items():
         assert [c for c, _t in schemas.COLUMNS[name]][:len(columns)] == columns
+
+
+def test_small_chunks_and_row_groups_give_the_same_rows(paths, tmp_path, monkeypatch):
+    tables.build(paths, now=LATER)
+    expected = {name: read(paths, name) for name in schemas.HOURLY_TABLES}
+    monkeypatch.setattr(tables, "CHUNK", 3)
+    monkeypatch.setattr(tables, "ROW_GROUP", 7)
+    tables.build(paths, rebuild=True, now=LATER)
+    assert {name: read(paths, name) for name in schemas.HOURLY_TABLES} == expected
+    path = next((paths.clean / "book_deltas").rglob("*.parquet"))
+    meta = pq.read_metadata(path)
+    assert meta.num_row_groups > 1 and all(meta.row_group(i).num_rows <= 7 for i in range(meta.num_row_groups))
