@@ -1,0 +1,8 @@
+# Tools for testing and linting. Install: python3 -m pip install -r requirements-dev.txt
+-r requirements.txt
+coverage==7.17.2
+hypothesis==6.170.14
+pytest==9.2.0
+pytest-cov==7.1.0
+pytest-timeout==2.4.0
+ruff==0.17.3
