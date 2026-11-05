@@ -111,3 +111,13 @@ def test_pick_markets_cli(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pick_markets, "pull_all_open_markets", fail)
     assert pick_markets.main([]) == 2
+
+
+def test_download_stops_if_the_cursor_repeats(tmp_path):
+    def handler(request):
+        return httpx.Response(200, json={"markets": [market(1, 10)], "next_cursor": "same"})
+
+    store = RawStore(tmp_path, compress=True)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client, pytest.raises(ValueError, match="kept paging"):
+        u.pull_all_open_markets(client, store)
+    store.close()

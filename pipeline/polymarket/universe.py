@@ -22,6 +22,8 @@ from ..http import request
 
 log = logging.getLogger(__name__)
 
+MAX_PAGES = 1000  # 1,000 markets a page: far more than exist; a guard against an endless loop
+
 
 def token_ids(market: dict) -> list[str]:
     """The outcome tokens. v1 markets list them in clobTokenIds (a JSON string), v2 in positionIds."""
@@ -117,7 +119,7 @@ def summarize(market: dict, rank_number: int) -> dict:
 
 def pull_all_open_markets(client: httpx.Client, store, sleep=None) -> list[dict]:
     """Download every open market. Saves each raw page before using it."""
-    markets, cursor, page = [], None, 0
+    markets, cursor, page, seen = [], None, 0, set()
     while True:
         # version=v1 AND version=v2: the default is v1 only, which would miss newer markets
         params = [("closed", "false"), ("version", "v1"), ("version", "v2"), ("limit", GAMMA_PAGE_SIZE)]
@@ -136,6 +138,9 @@ def pull_all_open_markets(client: httpx.Client, store, sleep=None) -> list[dict]
         cursor = body.get("next_cursor")
         if not cursor or not page_markets:
             return markets
+        if cursor in seen or page >= MAX_PAGES:
+            raise ValueError(f"Gamma kept paging (page {page}, cursor {cursor!r} seen before: {cursor in seen}); giving up")
+        seen.add(cursor)
 
 
 def build_universe(markets: list[dict], how_many: int, now: datetime | None = None) -> dict:
