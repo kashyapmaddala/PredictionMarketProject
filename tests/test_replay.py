@@ -320,9 +320,25 @@ def test_unsupported_and_bad_messages_are_kept():
 
 def test_clock_going_backwards_and_late_messages_are_reported():
     engine = run_engine([*legacy_start(), msg([book()], T0_NS + 10 * S), msg([book()], T0_NS + 5 * S),
+                         msg([book()], T0_NS + 6 * S),  # still behind: the same step, counted once
+                         msg([book()], T0_NS + 11 * S),
+                         msg([book()], T0_NS + 2000 * S), msg([book()], T0_NS + 100 * S),  # 1.9 s back: a problem
                          msg([book(stamp=T0_MS)], T0_NS + 60_000 * S)])
+    assert engine.stats.warnings[replay.W_CLOCK] == 1
     assert engine.stats.problems[replay.P_CLOCK] == 1
     assert engine.stats.warnings[replay.W_LATE] == 1
+
+
+def test_mismatches_are_split_into_one_offs_and_persistent_ones():
+    engine = run_engine([*legacy_start(), msg([book()], T0_NS),
+                         # Polymarket reports a best bid that its own next message contradicts
+                         msg(price_change(change(price="0.45", size="0", best_bid="0.45"), stamp=T0_MS + 1), T0_NS + S),
+                         msg(price_change(change(price="0.45", size="0", best_bid="0.40"), stamp=T0_MS + 2), T0_NS + 2 * S),
+                         # a wrong book: two wrong reports in a row
+                         msg(price_change(change(price="0.30", size="1", best_bid="0.41"), stamp=T0_MS + 3), T0_NS + 3 * S),
+                         msg(price_change(change(price="0.31", size="1", best_bid="0.41"), stamp=T0_MS + 4), T0_NS + 4 * S)])
+    assert engine.stats.problems[replay.P_BEST] == 3
+    assert engine.stats.count[replay.C_HEALED] == 1 and engine.stats.count[replay.C_PERSISTENT] == 1
 
 
 def test_collector_events_rows_and_no_rows_without_a_sink():

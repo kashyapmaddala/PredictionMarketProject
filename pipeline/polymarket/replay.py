@@ -51,6 +51,8 @@ MAX_EXAMPLES = 5
 # that matches any state within this many milliseconds of its stamp is not a disagreement.
 REST_TOLERANCE_MS = 10
 LATE_MS = 30_000  # a message received this long after its exchange time came late (sleep, backlog)
+HOUR_NS = 3_600_000_000_000
+BATCH_SETTLED_NS = 5_000_000_000  # a batch untouched this long is finished when a new hour starts
 STATE_VERSION = 1
 
 # Problem names (counted as failures by the validator)
@@ -61,11 +63,14 @@ P_TICK = "price not on the tick"
 P_EDGE = "price at 0 or 1"
 P_TRADE = "trade price outside 0 to 1"
 P_BAD = "message with a bad field (saved to unsupported_events)"
-P_CLOCK = "receive clock went backwards"
+P_CLOCK = "receive clock went backwards by more than 1 s"
 P_STALE_DIFF = "out-of-order full book disagreed with our book (corrected)"
+C_HEALED = "best-price mismatches gone at that token's next update (a one-off in Polymarket's report)"
+C_PERSISTENT = "best-price mismatches still there at the next update"
 # Warnings (listed, not failures)
 W_UNKNOWN = "unknown message type (saved to unsupported_events)"
 W_LATE = "messages received more than 30 s after their exchange time"
+W_CLOCK = "receive clock stepped back by up to 1 s (time sync adjusting the computer's clock)"
 
 
 def when(ns: int | None) -> str:
@@ -127,6 +132,8 @@ class Stats:
     outages: list = field(default_factory=list)  # finished Outage objects
     first_ns: int | None = None
     last_ns: int | None = None
+    open_mismatch: dict = field(default_factory=dict)  # token -> example, waiting for its next batch
+    clock_behind: bool = False  # inside a stretch where the receive clock went backwards
     subscribed: set = field(default_factory=set)  # every token we asked for
     booked: set = field(default_factory=set)  # every token that got at least one full book
 
@@ -222,7 +229,18 @@ class Engine:
             stats.first_ns = recv
         stats.last_ns = recv
         if recv < self.last_recv - 1_000_000:  # more than 1 ms backwards
-            stats.problem(P_CLOCK, f"{when(recv)} is {(self.last_recv - recv) / 1e9:.3f}s before the line before it ({source_file}:{source_line})")
+            if not stats.clock_behind:  # count each step back once, not every line until it catches up
+                behind = (self.last_recv - recv) / 1e9
+                text = f"{when(recv)} is {behind:.3f}s before the latest line before it ({source_file}:{source_line})"
+                if behind > 1:
+                    stats.problem(P_CLOCK, text)
+                else:
+                    stats.warning(W_CLOCK, text)
+            stats.clock_behind = True
+        else:
+            stats.clock_behind = False
+        if recv // HOUR_NS > self.last_recv // HOUR_NS:
+            self.settle(recv // HOUR_NS * HOUR_NS)
         self.last_recv = max(self.last_recv, recv)
         session = envelope.get("session")
         conn_id = envelope.get("conn")
@@ -237,14 +255,25 @@ class Engine:
         else:
             self.note(kind, raw, recv, session, conn)
 
+    def settle(self, hour_start_ns: int) -> None:
+        """A new hour starts: finish every batch received more than BATCH_SETTLED_NS before it, so
+        its row lands in the hour it belongs to (a token's batch otherwise waits for that token's
+        next change, maybe hours later). Batches still open near the boundary carry on."""
+        for token in sorted(t for t, p in self.pending.items() if p[1] < hour_start_ns - BATCH_SETTLED_NS):
+            self.finish_batch(token)
+
     def finish(self) -> None:
         """End of the data: run every check still waiting for more data."""
-        for token in list(self.pending):
+        # Sorted everywhere rows can come out of a loop: a saved and reloaded state has its dicts in
+        # sorted order, a live run in arrival order, and both must give the same rows
+        for token in sorted(self.pending):
             self.finish_batch(token)
-        for token in list(self.waiting):
+        for token in sorted(self.waiting):
             self.copy_due(token, None)
         for outage in self.open_outages.values():
             self.stats.outages.append(outage)
+        if self.stopped_at is not None:
+            self.stats.outages.append(Outage("collector", "stopped (not restarted yet)", self.stopped_at, self.stopped_at))
         self.open_outages, self.blind = {}, {}
 
     # ---------- rows ----------
@@ -334,7 +363,7 @@ class Engine:
     # ---------- connections coming and going ----------
 
     def stop_everything(self, recv: int, reason: str, crash: bool = False) -> None:
-        for conn in [c for c, v in self.conns.items() if v.live]:
+        for conn in sorted(c for c, v in self.conns.items() if v.live):
             # For a crash the drop really happened at the last line saved before this one
             when_noticed = self.conns[conn].last_ns if crash else recv
             self.conn_down(conn, when_noticed, reason, expected=not crash)
@@ -346,7 +375,7 @@ class Engine:
         info.live = False
         books = self.books.get(conn, {})
         orphans = []
-        for token in list(books):
+        for token in sorted(books):
             if self.owner.get(token) != conn:
                 continue
             self.finish_batch(token)
@@ -664,10 +693,19 @@ class Engine:
         ours_bid, ours_ask = book.best_bid(), book.best_ask()
         same_bid = ours_bid == theirs_bid or (ours_bid is None and theirs_bid in (None, 0))
         same_ask = ours_ask == theirs_ask or (ours_ask is None and theirs_ask in (None, 0, 1))
+        earlier = stats.open_mismatch.pop(token, None)
         if same_bid and same_ask:
             stats.count["matched Polymarket's best prices"] += 1
+            if earlier is not None:
+                # Our book agrees again at the very next update: the earlier report was a one-off
+                # inconsistency in Polymarket's own best prices, not a wrong book
+                stats.count[C_HEALED] += 1
         else:
-            stats.problem(P_BEST, f"{when(recv)} token {short(token)} ours {ours_bid}/{ours_ask}, Polymarket {theirs_bid}/{theirs_ask} ({src_file}:{src_line})")
+            text = f"{when(recv)} token {short(token)} ours {ours_bid}/{ours_ask}, Polymarket {theirs_bid}/{theirs_ask} ({src_file}:{src_line})"
+            stats.problem(P_BEST, text)
+            if earlier is not None:
+                stats.count[C_PERSISTENT] += 1
+            stats.open_mismatch[token] = text
         self.sanity(token, book, recv)
         saved = self.src
         self.src = (src_file, src_line)

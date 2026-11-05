@@ -183,6 +183,8 @@ def build_hour(paths: Paths, engine: Engine, day: str, hour: str, files: list[Pa
             damage += [d.describe() for d in raw.damage]
             if raw.bad_lines:
                 damage.append(f"{name}: {raw.bad_lines} unreadable lines")
+        start = datetime.strptime(f"{day} {hour}", "%Y-%m-%d %H").replace(tzinfo=UTC)
+        engine.settle(int((start + timedelta(hours=1)).timestamp()) * 1_000_000_000)
         counts = writer.close()
     except BaseException:
         writer.abort()

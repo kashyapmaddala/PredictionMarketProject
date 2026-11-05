@@ -62,7 +62,7 @@ def test_one_day_starts_from_the_saved_state_of_the_hour_before(paths):
     scripted_session(paths.raw, T - 30 * 60 * 1_000_000_000, minutes=2, stop=False)  # 2026-11-03 23:30
     store = RawStore(paths.raw, compress=True, session="s1")  # carries on after midnight, same connection
     store.write("message", json.dumps(price_change(change(TOKEN_A, "BUY", "0.30", "3", "0.43", "0.60"), stamp=T // 1_000_000 + 5)),
-                T + 10_000_000, conn=1)
+                T + 10_000_000, conn=2)  # the session reconnected once (connection 2)
     store.close()
     alone = validate(paths, "2026-11-04")
     assert alone.started_from is None

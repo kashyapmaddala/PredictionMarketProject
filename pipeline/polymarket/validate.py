@@ -136,6 +136,9 @@ def render(result: Report) -> tuple[str, bool]:
                  "failovers to a standby connection", "standby changes (not recorded twice)"):
         if count[name]:
             out.append(f"  {name}: {count[name]:,}")
+    for name in (replay.C_HEALED, replay.C_PERSISTENT):
+        if count[name]:
+            out.append(f"  {name}: {count[name]:,}")
     never = sorted(stats.subscribed - stats.booked)
     if never:
         out.append(f"  {len(never)} of {len(stats.subscribed)} subscribed tokens never got a full book "
