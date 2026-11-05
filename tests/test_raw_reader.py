@@ -124,7 +124,7 @@ def test_damage_with_no_good_piece_after_it(tmp_path):
         data[i] = 0
     path = tmp_path / "00.jsonl.gz"
     path.write_bytes(bytes(data))
-    got, reader = read(path)
+    _got, reader = read(path)
     assert [d.kind for d in reader.damage] == ["corrupt"]
     assert reader.damage[0].skipped_bytes == len(data)
 
@@ -172,7 +172,6 @@ def test_memory_stays_bounded_on_a_big_file(tmp_path):
     with gzip.open(path, "wb") as f:
         for i in range(40_000):
             f.write((json.dumps({"recv_ts_ns": i, "kind": "message", "raw": payload}) + "\n").encode())
-    size = 40_000 * 650
     tracemalloc.start()
     count = sum(1 for _ in RawFile(path))
     peak = tracemalloc.get_traced_memory()[1]

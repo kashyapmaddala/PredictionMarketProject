@@ -88,3 +88,53 @@ def run_engine(envelopes, sink=True, finish=True):
     if finish:
         engine.finish()
     return engine
+
+
+def scripted_session(folder, start_ns, minutes=3, session="s1", stop=True):
+    """Write a small, self-consistent collector session (new format) to raw files under
+    `folder`: started, one connection with an initial dump, changes every 5 s (with Polymarket's
+    best prices computed from a model book), trades, a REST copy, a drop and a reconnect with a
+    fresh dump, and a stopped note. Validating it must PASS. Returns the last time written."""
+    from decimal import Decimal
+
+    from pipeline.raw_store import RawStore
+    store = RawStore(folder, compress=True, session=session)
+    s = 1_000_000_000
+    model = {"0.40": "10"}  # TOKEN_A bids; asks stay at 0.60 x 20
+    store.write("started", {"session": session, "format": 2}, start_ns)
+
+    def best():
+        return str(max(Decimal(p) for p in model)) if model else "0"
+
+    def connect(t, conn):
+        store.write("connected", {"shard": 1, "url": "wss://test"}, t, conn=conn)
+        store.write("subscribed", {"shard": 1, "request": {"type": "market", "assets_ids": [TOKEN_A, TOKEN_B]}}, t + 1, conn=conn)
+        stamp = t // 1_000_000
+        bids = sorted(model.items(), key=lambda kv: Decimal(kv[0]))
+        store.write("message", json.dumps([book(TOKEN_A, stamp, bids=bids), book(TOKEN_B, stamp, bids=(("0.30", "5"),),
+                                                                               asks=(("0.70", "5"),))]), t + 2, conn=conn)
+
+    conn = 1
+    connect(start_ns + 1, conn)
+    t = start_ns
+    for i in range(minutes * 12):  # every 5 seconds
+        t = start_ns + (i + 1) * 5 * s
+        stamp = t // 1_000_000 - 50
+        price, size = f"0.{41 + i % 4}", str(i % 3)
+        if size == "0":
+            model.pop(price, None)
+        else:
+            model[price] = size
+        store.write("message", json.dumps(price_change(change(TOKEN_A, "BUY", price, size, best(), "0.60"), stamp=stamp)), t, conn=conn)
+        if i % 4 == 0:
+            store.write("message", json.dumps(trade(TOKEN_A, stamp, "0.5", str(i + 1))), t + 10, conn=conn)
+        if i == 7:
+            store.write("rest_books", rest(book(TOKEN_B, stamp, bids=(("0.30", "5"),), asks=(("0.70", "5"),))), t + 20)
+        if i == 15:
+            store.write("disconnected", {"shard": 1, "reason": "no close frame received or sent"}, t + 30, conn=conn)
+            conn += 1
+            connect(t + 40, conn)
+    if stop:
+        store.write("stopped", {"reason": "SIGTERM"}, t + 100)
+    store.close()
+    return t + 100
