@@ -248,19 +248,21 @@ class Collector:
         except TimeoutError:
             reason = f"no data for {s.silence_limit:g} seconds" if opened is not None else "timed out while connecting"
         except websockets.ConnectionClosed as problem:
-            reason = self.kick_reason.get(conn) or str(problem) or type(problem).__name__
+            reason = str(problem) or type(problem).__name__
         except (websockets.WebSocketException, OSError) as problem:
             reason = str(problem) or type(problem).__name__
         finally:
             self.sockets.pop(conn, None)
             up = 0.0 if opened is None else self.monotonic() - opened
+            kicked = self.kick_reason.pop(conn, None)
+            if reason is not None and kicked:
+                reason = kicked  # we closed it on purpose (a pause); whatever error followed is a symptom
             if retired:
                 why = self.retire_reason.pop(conn, None)
                 if why:
                     with contextlib.suppress(StorageFailed):
                         self.save("retired", {"shard": shard, "reason": why}, conn=conn)
             elif reason is not None:
-                self.kick_reason.pop(conn, None)
                 self.drops += 1
                 self.save("disconnected", {"shard": shard, "reason": reason, "seconds_up": round(up, 3)}, conn=conn)
                 log.warning("connection %d (shard %d) dropped after %.0fs: %s", conn, shard, up, reason)
@@ -323,11 +325,13 @@ class Collector:
         await asyncio.gather(*generation.tasks, return_exceptions=True)
 
     async def kick_all(self, reason: str) -> None:
-        """Close every live connection now (its shard reconnects at once)."""
+        """Drop every live connection now (its shard reconnects at once). After a pause the server
+        has usually hung up already, so a polite close would only wait for a reply that never comes:
+        the connection is cut instead."""
         for conn, ws in list(self.sockets.items()):
             self.kick_reason[conn] = reason
             with contextlib.suppress(Exception):
-                await ws.close(code=1001, reason="reconnecting")
+                ws.transport.abort()
 
     # ---------- background jobs ----------
 
